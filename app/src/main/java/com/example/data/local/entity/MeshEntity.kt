@@ -11,6 +11,7 @@ data class MeshEntity(
     val localPublicKey: String,
     val localPrivateKey: String,
     val localFingerprint: String,
+    val meshSecret: String = "",
     val port: Int = 45990,
     val createdAt: Long = System.currentTimeMillis()
 )

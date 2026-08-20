@@ -135,6 +135,7 @@ data class QrJoinToken(
     val hostPublicKey: String,
     val hostDeviceName: String,
     val ephemeralToken: String,
+    val meshSecret: String? = null,
     val hostPort: Int = 45990,
     val hostIp: String? = null,
     val timestamp: Long = System.currentTimeMillis()
@@ -145,6 +146,7 @@ data class QrJoinToken(
             put("hostPublicKey", hostPublicKey)
             put("hostDeviceName", hostDeviceName)
             put("ephemeralToken", ephemeralToken)
+            meshSecret?.let { put("meshSecret", it) }
             put("hostPort", hostPort)
             hostIp?.let { put("hostIp", it) }
             put("timestamp", timestamp)
@@ -160,6 +162,7 @@ data class QrJoinToken(
                     hostPublicKey = json.getString("hostPublicKey"),
                     hostDeviceName = json.getString("hostDeviceName"),
                     ephemeralToken = json.getString("ephemeralToken"),
+                    meshSecret = json.optString("meshSecret", null),
                     hostPort = json.optInt("hostPort", 45990),
                     hostIp = json.optString("hostIp", null),
                     timestamp = json.optLong("timestamp", System.currentTimeMillis())

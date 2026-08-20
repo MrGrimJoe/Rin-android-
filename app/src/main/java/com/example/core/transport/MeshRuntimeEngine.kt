@@ -300,13 +300,33 @@ class MeshRuntimeEngine(
 
     suspend fun processIncomingPacket(packet: MeshPacket) {
         val meshInfo = repository.getMeshInfoSync() ?: return
-        val meshKey = CryptoEngine.deriveMeshEncryptionKey(meshInfo.meshName)
+        val meshKey = CryptoEngine.deriveMeshEncryptionKey(meshInfo.meshSecret, meshInfo.meshName)
 
-        // Decrypt payload using AES-256-GCM
+        // Decrypt payload using AES-256-GCM with ECDH session key or mesh master key
         val plainPayload = if (packet.type == PacketType.HEARTBEAT || packet.type == PacketType.HELLO) {
             packet.payload
         } else {
-            CryptoEngine.decryptPayload(packet.payload, meshKey)
+            try {
+                // If packet was targeted directly to our key and has a valid senderKey, use peer ECDH session key
+                if (packet.targetKey == meshInfo.localPublicKey && packet.senderKey.isNotBlank()) {
+                    val peerSessionKey = CryptoEngine.derivePeerSessionKey(
+                        localPrivateKeyB64 = meshInfo.localPrivateKey,
+                        remotePublicKeyB64 = packet.senderKey,
+                        sessionId = packet.sessionId
+                    )
+                    CryptoEngine.decryptPayload(packet.payload, peerSessionKey)
+                } else {
+                    CryptoEngine.decryptPayload(packet.payload, meshKey)
+                }
+            } catch (e: Exception) {
+                // Secondary attempt with meshKey if targeted attempt threw
+                try {
+                    CryptoEngine.decryptPayload(packet.payload, meshKey)
+                } catch (ex: Exception) {
+                    Log.w(tag, "Failed to decrypt incoming packet from ${packet.senderName}: ${ex.message}")
+                    return
+                }
+            }
         }
 
         val payloadSummary = when (packet.type) {
@@ -466,7 +486,7 @@ class MeshRuntimeEngine(
         val devices = repository.getRemoteDevicesSync()
         if (devices.isEmpty()) return
 
-        val meshKey = CryptoEngine.deriveMeshEncryptionKey(meshInfo.meshName)
+        val meshKey = CryptoEngine.deriveMeshEncryptionKey(meshInfo.meshSecret, meshInfo.meshName)
         val encryptedPayload = CryptoEngine.encryptPayload(text, meshKey)
         val sig = CryptoEngine.sign(encryptedPayload, meshInfo.localPrivateKey)
 
@@ -518,13 +538,23 @@ class MeshRuntimeEngine(
         val meshInfo = repository.getMeshInfoSync() ?: return
         val devices = repository.getRemoteDevicesSync()
         val target = if (targetDeviceKey != null) devices.find { it.publicKey == targetDeviceKey } else null
+        val sessionId = CryptoEngine.generateSessionId()
 
-        val meshKey = CryptoEngine.deriveMeshEncryptionKey(meshInfo.meshName)
-        val encryptedPayload = CryptoEngine.encryptPayload(url, meshKey)
+        val encryptionKey = if (targetDeviceKey != null) {
+            try {
+                CryptoEngine.derivePeerSessionKey(meshInfo.localPrivateKey, targetDeviceKey, sessionId)
+            } catch (_: Exception) {
+                CryptoEngine.deriveMeshEncryptionKey(meshInfo.meshSecret, meshInfo.meshName)
+            }
+        } else {
+            CryptoEngine.deriveMeshEncryptionKey(meshInfo.meshSecret, meshInfo.meshName)
+        }
+
+        val encryptedPayload = CryptoEngine.encryptPayload(url, encryptionKey)
         val sig = CryptoEngine.sign(encryptedPayload, meshInfo.localPrivateKey)
 
         val packet = MeshPacket(
-            sessionId = CryptoEngine.generateSessionId(),
+            sessionId = sessionId,
             sequence = sequenceNumber.incrementAndGet(),
             type = PacketType.BROWSER_HANDOFF,
             senderKey = meshInfo.localPublicKey,
@@ -580,7 +610,11 @@ class MeshRuntimeEngine(
 
     suspend fun sendFileSimulation(fileName: String, fileSizeKb: Long, targetDevice: TrustedDeviceEntity, onProgress: (Float) -> Unit) {
         val meshInfo = repository.getMeshInfoSync() ?: return
-        val meshKey = CryptoEngine.deriveMeshEncryptionKey(meshInfo.meshName)
+        val sessionKey = try {
+            CryptoEngine.derivePeerSessionKey(meshInfo.localPrivateKey, targetDevice.publicKey)
+        } catch (_: Exception) {
+            CryptoEngine.deriveMeshEncryptionKey(meshInfo.meshSecret, meshInfo.meshName)
+        }
         val totalChunks = 5
         for (i in 1..totalChunks) {
             delay(150)
@@ -588,7 +622,7 @@ class MeshRuntimeEngine(
             onProgress(progress)
 
             val rawChunk = "CHUNK $i/$totalChunks: $fileName (${fileSizeKb / totalChunks} KB)"
-            val encryptedChunk = CryptoEngine.encryptPayload(rawChunk, meshKey)
+            val encryptedChunk = CryptoEngine.encryptPayload(rawChunk, sessionKey)
             val sig = CryptoEngine.sign(encryptedChunk, meshInfo.localPrivateKey)
 
             val packet = MeshPacket(
@@ -666,7 +700,7 @@ class MeshRuntimeEngine(
     suspend fun revokeDevice(publicKey: String) {
         val meshInfo = repository.getMeshInfoSync() ?: return
         val devices = repository.getRemoteDevicesSync()
-        val meshKey = CryptoEngine.deriveMeshEncryptionKey(meshInfo.meshName)
+        val meshKey = CryptoEngine.deriveMeshEncryptionKey(meshInfo.meshSecret, meshInfo.meshName)
         val encryptedPayload = CryptoEngine.encryptPayload(publicKey, meshKey)
         val sig = CryptoEngine.sign(encryptedPayload, meshInfo.localPrivateKey)
 
@@ -728,7 +762,13 @@ class MeshRuntimeEngine(
         )
         repository.saveDevice(newDevice)
 
-        val meshKey = CryptoEngine.deriveMeshEncryptionKey(meshInfo.meshName)
+        // If joining an existing mesh via QR token, adopt the meshSecret from host
+        val activeSecret = qrToken.meshSecret ?: meshInfo.meshSecret
+        if (!qrToken.meshSecret.isNullOrBlank() && meshInfo.meshSecret != qrToken.meshSecret) {
+            repository.saveMesh(meshInfo.copy(meshSecret = qrToken.meshSecret))
+        }
+
+        val meshKey = CryptoEngine.deriveMeshEncryptionKey(activeSecret, meshInfo.meshName)
         val encryptedPayload = CryptoEngine.encryptPayload(qrToken.ephemeralToken, meshKey)
         val sig = CryptoEngine.sign(encryptedPayload, meshInfo.localPrivateKey)
 
@@ -768,6 +808,7 @@ class MeshRuntimeEngine(
 
     suspend fun createInitialMesh(meshName: String, deviceName: String = getDefaultDeviceName()): MeshEntity {
         val keys = CryptoEngine.generateIdentityKeyPair()
+        val meshSecret = CryptoEngine.generateEphemeralSecret()
         val myIp = NetworkHelper.getLocalIpAddress()
         val mesh = MeshEntity(
             meshName = meshName.ifBlank { "My Mesh" },
@@ -775,6 +816,7 @@ class MeshRuntimeEngine(
             localPublicKey = keys.publicKey,
             localPrivateKey = keys.privateKey,
             localFingerprint = keys.fingerprint,
+            meshSecret = meshSecret,
             port = activeListeningPort
         )
         repository.saveMesh(mesh)

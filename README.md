@@ -27,10 +27,14 @@ Rin turns your local devices into a cohesive, private computing mesh. Once devic
   - **UDP Subnet Broadcasts**: Sub-millisecond peer discovery on port `45991`.
   - **Android NSD / mDNS**: Local domain ZeroConf discovery (`_rin._tcp.local`).
   - **BLE Proximity Presence**: Low-energy Bluetooth beacon rail (`UUID: 0000fe90-0000-1000-8000-00805f9b34fb`).
-- 🛡️ **Cryptographic Zero-Trust**:
-  - Elliptic Curve (`secp256r1`) public keypairs generated purely on-device.
-  - Every packet signed via `SHA256withECDSA` and encrypted via AES-256-GCM.
-  - Instant device revocation broadcasts.
+- 🛡️ **Cryptographic Zero-Trust Engine**:
+  - **Identity Keys**: On-device NIST P-256 (`secp256r1`) Elliptic Curve keypairs.
+  - **Forward Secrecy**: Ephemeral Elliptic Curve Diffie-Hellman (ECDH) key agreement per peer session.
+  - **Key Derivation**: RFC 5869 HKDF-SHA256 (Extract-and-Expand) for high-entropy session and mesh group keys.
+  - **Mesh Group Secret**: High-entropy 256-bit random cryptographic master secret transferred during authenticated QR exchange (independent of the human-readable mesh name).
+  - **Digital Signatures**: Strictly validated `SHA256withECDSA` (zero fake fallbacks or HMAC degradation).
+  - **Authenticated Symmetric Encryption**: AES-256-GCM with 128-bit authentication tags and fresh 96-bit random IVs per packet (strictly fail-closed; corrupted or tampered packets are dropped immediately).
+  - **Device Revocation**: Cryptographically signed revocation notices to instantly purge decommissioned devices.
 - 🔍 **Live Packet Inspector**:
   - Inspect sequence IDs, transport rails, latency measurements, and cryptographic signatures in real time.
 

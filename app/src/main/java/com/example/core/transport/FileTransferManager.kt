@@ -93,7 +93,11 @@ class FileTransferManager(
         onProgress: (Float, Long, Long) -> Unit // (progressRatio, bytesSent, totalBytes)
     ): Boolean = withContext(Dispatchers.IO) {
         val meshInfo = repository.getMeshInfoSync() ?: return@withContext false
-        val meshKey = CryptoEngine.deriveMeshEncryptionKey(meshInfo.meshName)
+        val sessionKey = try {
+            CryptoEngine.derivePeerSessionKey(meshInfo.localPrivateKey, targetDevice.publicKey)
+        } catch (_: Exception) {
+            CryptoEngine.deriveMeshEncryptionKey(meshInfo.meshSecret, meshInfo.meshName)
+        }
 
         val (fileName, totalSize) = getDisplayNameAndSize(uri)
         val mimeType = context.contentResolver.getType(uri) ?: "application/octet-stream"
@@ -130,7 +134,7 @@ class FileTransferManager(
 
         // 2. Dispatch FILE_START Packet
         val metaJson = metadata.toJson()
-        val encMeta = CryptoEngine.encryptPayload(metaJson, meshKey)
+        val encMeta = CryptoEngine.encryptPayload(metaJson, sessionKey)
         val sigMeta = CryptoEngine.sign(encMeta, meshInfo.localPrivateKey)
 
         val startPacket = MeshPacket(
@@ -190,7 +194,7 @@ class FileTransferManager(
                     dataBase64 = base64Data
                 ).toJson()
 
-                val encChunk = CryptoEngine.encryptPayload(chunkPayload, meshKey)
+                val encChunk = CryptoEngine.encryptPayload(chunkPayload, sessionKey)
                 val sigChunk = CryptoEngine.sign(encChunk, meshInfo.localPrivateKey)
 
                 val chunkPacket = MeshPacket(
@@ -222,7 +226,7 @@ class FileTransferManager(
 
         // 4. Dispatch FILE_COMPLETE Packet
         val completePayload = metadata.toJson()
-        val encComplete = CryptoEngine.encryptPayload(completePayload, meshKey)
+        val encComplete = CryptoEngine.encryptPayload(completePayload, sessionKey)
         val sigComplete = CryptoEngine.sign(encComplete, meshInfo.localPrivateKey)
 
         val completePacket = MeshPacket(

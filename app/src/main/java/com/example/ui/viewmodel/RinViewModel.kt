@@ -207,11 +207,15 @@ class RinViewModel(application: Application) : AndroidViewModel(application) {
         if (mesh == null) return
         val ephemeralToken = CryptoEngine.generateEphemeralToken()
         val currentIp = runtimeEngine.localIpAddress.value
+        val secret = mesh.meshSecret.ifBlank {
+            CryptoEngine.deriveMeshSecretFromKey(mesh.localPrivateKey, mesh.meshName)
+        }
         _currentJoinToken.value = QrJoinToken(
             meshName = mesh.meshName,
             hostPublicKey = mesh.localPublicKey,
             hostDeviceName = mesh.localDeviceName,
             ephemeralToken = ephemeralToken,
+            meshSecret = secret,
             hostPort = runtimeEngine.activeListeningPort,
             hostIp = currentIp
         )
