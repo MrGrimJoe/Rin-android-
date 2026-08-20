@@ -12,7 +12,10 @@ import com.example.core.network.BleMeshDiscovery
 import com.example.core.network.MeshNotificationHelper
 import com.example.core.network.NetworkHelper
 import com.example.core.network.NsdMeshDiscovery
+import com.example.core.network.StunCandidate
+import com.example.core.network.StunHolePunchEngine
 import com.example.core.network.UdpBeaconEngine
+import com.example.core.network.WifiDirectMeshManager
 import com.example.core.protocol.ConnectionState
 import com.example.core.protocol.MeshPacket
 import com.example.core.protocol.PacketType
@@ -68,6 +71,12 @@ class MeshRuntimeEngine(
     private var nsdDiscovery: NsdMeshDiscovery? = null
     private var udpBeaconEngine: UdpBeaconEngine? = null
     private var bleDiscovery: BleMeshDiscovery? = null
+    var wifiDirectManager: WifiDirectMeshManager? = null
+        private set
+    val stunEngine = StunHolePunchEngine()
+
+    private val _publicStunEndpoint = MutableStateFlow<StunCandidate?>(null)
+    val publicStunEndpoint: StateFlow<StunCandidate?> = _publicStunEndpoint.asStateFlow()
 
     private val _localIpAddress = MutableStateFlow(NetworkHelper.getLocalIpAddress())
     val localIpAddress: StateFlow<String> = _localIpAddress.asStateFlow()
@@ -104,6 +113,7 @@ class MeshRuntimeEngine(
         nsdDiscovery?.stop()
         udpBeaconEngine?.stop()
         bleDiscovery?.stop()
+        wifiDirectManager?.stop()
     }
 
     private fun initializeZeroConfDiscovery() {
@@ -139,6 +149,28 @@ class MeshRuntimeEngine(
             }
             bleDiscovery?.startAdvertising(mesh.meshName, mesh.localPublicKey)
             bleDiscovery?.startScanning()
+
+            // 4. Wi-Fi Direct (Off-Grid peer-to-peer without router)
+            wifiDirectManager = WifiDirectMeshManager(context) { groupOwnerIp, isHost ->
+                scope.launch(Dispatchers.IO) {
+                    Log.i(tag, "Wi-Fi Direct P2P Group Link established: $groupOwnerIp (isHost: $isHost)")
+                    _meshEventNotifications.emit("Wi-Fi Direct P2P group active ($groupOwnerIp)")
+                }
+            }
+            wifiDirectManager?.start()
+
+            // 5. STUN Discovery (Public reflexive NAT mapping for cellular/internet traversal)
+            scope.launch(Dispatchers.IO) {
+                try {
+                    val candidate = stunEngine.resolvePublicEndpoint(activeListeningPort)
+                    if (candidate != null) {
+                        _publicStunEndpoint.value = candidate
+                        Log.i(tag, "STUN Public Reflexive NAT endpoint: ${candidate.publicIp}:${candidate.publicPort}")
+                    }
+                } catch (e: Exception) {
+                    Log.w(tag, "STUN reflexive resolution deferred: ${e.message}")
+                }
+            }
         }
     }
 

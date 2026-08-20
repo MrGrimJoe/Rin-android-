@@ -60,7 +60,9 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.example.core.network.StunCandidate
 import com.example.ui.components.AddDeviceBottomSheet
+import com.example.ui.components.AdvancedMeshRailsCard
 import com.example.ui.components.ClipboardHistorySheet
 import com.example.ui.components.DeviceCard
 import com.example.ui.components.FileTransferDialog
@@ -100,6 +102,7 @@ fun RinMainScreen(
     val transferStatusLabel by viewModel.transferStatusLabel.collectAsStateWithLifecycle()
     val incomingSharePayload by viewModel.incomingSharePayload.collectAsStateWithLifecycle()
     val lastReceivedFile by viewModel.lastReceivedFile.collectAsStateWithLifecycle()
+    val stunCandidate by viewModel.publicStunEndpoint.collectAsStateWithLifecycle()
 
     var quickSendText by remember { mutableStateOf("") }
     val snackbarHostState = remember { SnackbarHostState() }
@@ -403,6 +406,15 @@ fun RinMainScreen(
                             }
                         }
                     }
+                }
+
+                // Advanced Transport Rails Card (C++ Bridge, Wi-Fi Direct Off-Grid, STUN Traversal)
+                item {
+                    AdvancedMeshRailsCard(
+                        stunCandidate = stunCandidate,
+                        onScanWifiDirect = { viewModel.triggerWifiDirectDiscovery() },
+                        onCreateWifiDirectGroup = { viewModel.createOffGridWifiDirectGroup() }
+                    )
                 }
 
                 // Section Label

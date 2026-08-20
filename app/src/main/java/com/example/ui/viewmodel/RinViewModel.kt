@@ -5,6 +5,8 @@ import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.core.crypto.CryptoEngine
+import com.example.core.network.StunCandidate
+import com.example.core.network.WifiP2pPeer
 import com.example.core.protocol.ConnectionState
 import com.example.core.protocol.MeshPacket
 import com.example.core.protocol.PacketType
@@ -189,6 +191,17 @@ class RinViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     val localIpAddress: StateFlow<String> = runtimeEngine.localIpAddress
+    val publicStunEndpoint: StateFlow<StunCandidate?> = runtimeEngine.publicStunEndpoint
+
+    fun triggerWifiDirectDiscovery() {
+        runtimeEngine.wifiDirectManager?.discoverPeers()
+        _userMessage.value = "Scanning for off-grid Wi-Fi Direct peers..."
+    }
+
+    fun createOffGridWifiDirectGroup() {
+        runtimeEngine.wifiDirectManager?.createGroup()
+        _userMessage.value = "Creating Wi-Fi Direct autonomous group..."
+    }
 
     fun refreshJoinToken(mesh: MeshEntity? = meshInfo.value) {
         if (mesh == null) return
