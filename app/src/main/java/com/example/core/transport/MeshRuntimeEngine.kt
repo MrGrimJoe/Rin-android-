@@ -8,6 +8,9 @@ import android.net.Uri
 import android.os.Build
 import android.util.Log
 import com.example.core.crypto.CryptoEngine
+import com.example.core.logging.AuditCategory
+import com.example.core.logging.AuditLevel
+import com.example.core.logging.MeshAuditLogger
 import com.example.core.network.BleMeshDiscovery
 import com.example.core.network.MeshNotificationHelper
 import com.example.core.network.NetworkHelper
@@ -128,17 +131,16 @@ class MeshRuntimeEngine(
             }
             udpBeaconEngine?.start(mesh.meshName, mesh.localPublicKey, mesh.localDeviceName, activeListeningPort)
 
-            // 2. Android NsdManager (mDNS fallback)
-            nsdDiscovery = NsdMeshDiscovery(context) { serviceName, host, port ->
+            // 2. Android NsdManager (DNS-SD / mDNS Zero-Config Service Discovery)
+            nsdDiscovery = NsdMeshDiscovery(context) { serviceName, host, port, attributes ->
                 scope.launch(Dispatchers.IO) {
-                    val existing = repository.getRemoteDevicesSync()
-                    val match = existing.find { it.ipAddress == host }
-                    if (match != null) {
-                        repository.updateDeviceState(match.publicKey, ConnectionState.CONNECTED)
-                    }
+                    val peerMeshName = attributes["mesh"] ?: mesh.meshName
+                    val peerDeviceName = attributes["devname"] ?: serviceName.removePrefix("Rin-")
+                    val peerPublicKey = attributes["pubkey"] ?: "nsd_peer_${host.replace(".", "_")}"
+                    handleDiscoveredPeer(peerMeshName, peerPublicKey, peerDeviceName, host, port)
                 }
             }
-            nsdDiscovery?.registerService(mesh.localDeviceName, activeListeningPort, mesh.meshName)
+            nsdDiscovery?.registerService(mesh.localDeviceName, activeListeningPort, mesh.meshName, mesh.localPublicKey)
             nsdDiscovery?.startDiscovery()
 
             // 3. BLE Proximity Rail (Low energy presence beacons)
@@ -273,6 +275,7 @@ class MeshRuntimeEngine(
 
             // Cryptographic Digital Signature Verification
             val isValid = CryptoEngine.verify(packet.payload, packet.signature, packet.senderKey)
+            MeshAuditLogger.logSignatureVerification(isValid, packet.senderName, packet.senderKey, packet.sequence)
             if (!isValid) {
                 Log.w(tag, "Packet signature verification FAILED for sender: ${packet.senderName} (${packet.senderKey.take(8)})")
                 return
@@ -300,32 +303,38 @@ class MeshRuntimeEngine(
 
     suspend fun processIncomingPacket(packet: MeshPacket) {
         val meshInfo = repository.getMeshInfoSync() ?: return
-        val meshKey = CryptoEngine.deriveMeshEncryptionKey(meshInfo.meshSecret, meshInfo.meshName)
 
-        // Decrypt payload using AES-256-GCM with ECDH session key or mesh master key
+        // Decrypt payload using AES-256-GCM
         val plainPayload = if (packet.type == PacketType.HEARTBEAT || packet.type == PacketType.HELLO) {
             packet.payload
-        } else {
+        } else if (packet.targetKey == meshInfo.localPublicKey && packet.senderKey.isNotBlank()) {
+            // Targeted Unicast packet: Explicitly decrypt via ECDH session key
             try {
-                // If packet was targeted directly to our key and has a valid senderKey, use peer ECDH session key
-                if (packet.targetKey == meshInfo.localPublicKey && packet.senderKey.isNotBlank()) {
-                    val peerSessionKey = CryptoEngine.derivePeerSessionKey(
-                        localPrivateKeyB64 = meshInfo.localPrivateKey,
-                        remotePublicKeyB64 = packet.senderKey,
-                        sessionId = packet.sessionId
-                    )
-                    CryptoEngine.decryptPayload(packet.payload, peerSessionKey)
-                } else {
-                    CryptoEngine.decryptPayload(packet.payload, meshKey)
-                }
+                val peerSessionKey = CryptoEngine.derivePeerSessionKey(
+                    localPrivateKeyB64 = meshInfo.localPrivateKey,
+                    remotePublicKeyB64 = packet.senderKey,
+                    sessionId = packet.sessionId
+                )
+                val decrypted = CryptoEngine.decryptPayload(packet.payload, peerSessionKey)
+                MeshAuditLogger.logEcdhDecryptionSuccess(packet.sequence, packet.senderName, packet.senderKey, packet.sessionId)
+                decrypted
             } catch (e: Exception) {
-                // Secondary attempt with meshKey if targeted attempt threw
-                try {
-                    CryptoEngine.decryptPayload(packet.payload, meshKey)
-                } catch (ex: Exception) {
-                    Log.w(tag, "Failed to decrypt incoming packet from ${packet.senderName}: ${ex.message}")
-                    return
-                }
+                MeshAuditLogger.logEcdhDecryptionFailure(packet.sequence, packet.senderName, packet.senderKey, packet.sessionId, e)
+                return
+            }
+        } else {
+            // Group Broadcast packet: Decrypt via 256-bit Mesh Master Key
+            try {
+                val meshKey = CryptoEngine.deriveMeshEncryptionKey(meshInfo.meshSecret, meshInfo.meshName)
+                val decrypted = CryptoEngine.decryptPayload(packet.payload, meshKey)
+                MeshAuditLogger.logBroadcastDecryptionSuccess(packet.sequence, packet.type.name, packet.senderName)
+                decrypted
+            } catch (e: Exception) {
+                MeshAuditLogger.logBroadcastDecryptionFailure(packet.sequence, packet.type.name, packet.senderName, e)
+                _meshEventNotifications.emit(
+                    "Dropped unauthenticated/corrupted ${packet.type} packet from ${packet.senderName}"
+                )
+                return
             }
         }
 
@@ -470,9 +479,11 @@ class MeshRuntimeEngine(
             val ackLine = reader.readLine()
             val elapsedMs = (System.nanoTime() - startNs) / 1_000_000
             Log.d(tag, "Socket transmission to $ip:$port succeeded in ${elapsedMs}ms (ACK: $ackLine)")
+            MeshAuditLogger.logConnectionEstablished(packet.rail.name, ip, port, packet.senderName)
             return@withContext elapsedMs.coerceAtLeast(1)
         } catch (e: Exception) {
             Log.d(tag, "Direct socket transmission to $ip:$port failed: ${e.message}")
+            MeshAuditLogger.logConnectionFailed(packet.rail.name, ip, port, e, packet.senderName)
             return@withContext null
         } finally {
             try {
@@ -785,6 +796,7 @@ class MeshRuntimeEngine(
         )
 
         val realLatency = transmitOverNetwork(newDevice.ipAddress, newDevice.port, packet)
+        MeshAuditLogger.logHandshakeCompleted(qrToken.hostDeviceName, qrToken.hostPublicKey, "LAN/QR")
 
         repository.recordPacket(
             MeshPacketEntity(

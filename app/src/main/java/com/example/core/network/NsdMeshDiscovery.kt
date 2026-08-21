@@ -4,10 +4,18 @@ import android.content.Context
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
 import android.util.Log
+import com.example.core.logging.MeshAuditLogger
+import java.nio.charset.StandardCharsets
 
+/**
+ * Android Network Service Discovery (mDNS / DNS-SD ZeroConf engine).
+ *
+ * Automatically advertises local mesh endpoints on the LAN subnet and resolves
+ * discovered peer instances to initiate cryptographic handshakes without manual IP entry.
+ */
 class NsdMeshDiscovery(
     private val context: Context,
-    private val onPeerDiscovered: (serviceName: String, hostAddress: String, port: Int) -> Unit
+    private val onPeerDiscovered: (serviceName: String, hostAddress: String, port: Int, attributes: Map<String, String>) -> Unit
 ) {
     private val tag = "NsdMeshDiscovery"
     private val serviceType = "_rin-mesh._tcp."
@@ -21,19 +29,28 @@ class NsdMeshDiscovery(
         nsdManager = context.getSystemService(Context.NSD_SERVICE) as? NsdManager
     }
 
-    fun registerService(deviceName: String, port: Int, meshName: String) {
+    fun registerService(deviceName: String, port: Int, meshName: String, publicKey: String) {
         val serviceInfo = NsdServiceInfo().apply {
-            serviceName = "Rin-$deviceName"
+            // Sanitize service name for DNS-SD RFC compliance
+            val cleanName = deviceName.replace(Regex("[^a-zA-Z0-9-]"), "-").take(20)
+            serviceName = "Rin-$cleanName"
             serviceType = this@NsdMeshDiscovery.serviceType
             setPort(port)
-            // Optional TXT attributes
+
+            // DNS-SD TXT Record attributes for automatic Zero-Config identification
             setAttribute("mesh", meshName)
+            setAttribute("devname", deviceName)
+            // Store fingerprint / key identifier in TXT
+            val keyFingerprint = if (publicKey.length > 24) publicKey.take(24) else publicKey
+            setAttribute("pubkey", keyFingerprint)
+            setAttribute("proto", "rin-v1")
         }
 
         registrationListener = object : NsdManager.RegistrationListener {
-            override fun onServiceRegistered(NsdServiceInfo: NsdServiceInfo) {
-                registeredServiceName = NsdServiceInfo.serviceName
+            override fun onServiceRegistered(registeredInfo: NsdServiceInfo) {
+                registeredServiceName = registeredInfo.serviceName
                 Log.d(tag, "NSD Service registered successfully: $registeredServiceName on port $port")
+                MeshAuditLogger.logNsdDiscovered(registeredInfo.serviceName, "0.0.0.0", port, meshName)
             }
 
             override fun onRegistrationFailed(serviceInfo: NsdServiceInfo, errorCode: Int) {
@@ -107,21 +124,37 @@ class NsdMeshDiscovery(
     private fun resolveService(serviceInfo: NsdServiceInfo) {
         val resolveListener = object : NsdManager.ResolveListener {
             override fun onResolveFailed(serviceInfo: NsdServiceInfo, errorCode: Int) {
-                Log.e(tag, "NSD Resolve failed: $errorCode for ${serviceInfo.serviceName}")
+                Log.w(tag, "NSD Resolve failed: $errorCode for ${serviceInfo.serviceName}")
             }
 
-            override fun onServiceResolved(serviceInfo: NsdServiceInfo) {
-                val host = serviceInfo.host?.hostAddress ?: return
-                val port = serviceInfo.port
-                Log.d(tag, "NSD Service resolved: ${serviceInfo.serviceName} at $host:$port")
-                onPeerDiscovered(serviceInfo.serviceName, host, port)
+            override fun onServiceResolved(resolvedInfo: NsdServiceInfo) {
+                val host = resolvedInfo.host?.hostAddress ?: return
+                // Ignore loopback or self-addressed host if matching port
+                val port = resolvedInfo.port
+
+                val attrMap = mutableMapOf<String, String>()
+                try {
+                    resolvedInfo.attributes?.forEach { (k, v) ->
+                        if (v != null) {
+                            attrMap[k] = String(v, StandardCharsets.UTF_8)
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.w(tag, "Failed to read NSD attributes: ${e.message}")
+                }
+
+                val meshName = attrMap["mesh"]
+                Log.i(tag, "NSD Peer auto-resolved: ${resolvedInfo.serviceName} at $host:$port (Mesh: $meshName)")
+                MeshAuditLogger.logNsdDiscovered(resolvedInfo.serviceName, host, port, meshName)
+
+                onPeerDiscovered(resolvedInfo.serviceName, host, port, attrMap)
             }
         }
 
         try {
             nsdManager?.resolveService(serviceInfo, resolveListener)
         } catch (e: Exception) {
-            Log.e(tag, "Error resolving service", e)
+            Log.w(tag, "Error initiating service resolution for ${serviceInfo.serviceName}", e)
         }
     }
 
