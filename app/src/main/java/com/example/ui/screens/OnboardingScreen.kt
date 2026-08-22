@@ -21,8 +21,11 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.filled.CameraAlt
 import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Devices
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.QrCodeScanner
 import androidx.compose.material.icons.filled.Security
@@ -31,6 +34,8 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.FilterChip
+import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -40,6 +45,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -54,7 +60,9 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.R
+import com.example.core.crypto.CryptoEngine
 import com.example.core.protocol.QrJoinToken
+import com.example.ui.components.QrCameraScanner
 import com.example.ui.components.QrCodeCanvas
 import com.example.ui.theme.RinBorder
 import com.example.ui.theme.RinCyanAccent
@@ -77,8 +85,9 @@ fun OnboardingScreen(
     var state by remember { mutableStateOf(OnboardingState.CHOICE) }
     var meshNameInput by remember { mutableStateOf("") }
     var manualTokenJson by remember { mutableStateOf("") }
-    var ipInput by remember { mutableStateOf("") }
-    var portInput by remember { mutableStateOf("45990") }
+    var joinScanMode by remember { mutableIntStateOf(0) } // 0 = Camera QR, 1 = Manual Token / Host IP
+    var onboardingScanError by remember { mutableStateOf<String?>(null) }
+    var onboardingManualError by remember { mutableStateOf<String?>(null) }
 
     Box(
         modifier = modifier
@@ -258,96 +267,133 @@ fun OnboardingScreen(
 
                             Spacer(modifier = Modifier.height(12.dp))
 
-                            Text(
-                                text = "Enter host IP address or paste token json from other phone:",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-
-                            Spacer(modifier = Modifier.height(10.dp))
-
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
                                 horizontalArrangement = Arrangement.spacedBy(8.dp)
                             ) {
-                                OutlinedTextField(
-                                    value = ipInput,
-                                    onValueChange = { ipInput = it },
-                                    label = { Text("Host Phone IP") },
-                                    placeholder = { Text("192.168.1.X") },
-                                    modifier = Modifier.weight(2f),
-                                    shape = RoundedCornerShape(10.dp),
-                                    singleLine = true
+                                FilterChip(
+                                    selected = joinScanMode == 0,
+                                    onClick = { joinScanMode = 0 },
+                                    label = { Text("Scan Pairing QR") },
+                                    leadingIcon = {
+                                        Icon(Icons.Default.CameraAlt, contentDescription = null, modifier = Modifier.size(16.dp))
+                                    },
+                                    colors = FilterChipDefaults.filterChipColors(
+                                        selectedContainerColor = RinTealPrimary.copy(alpha = 0.2f),
+                                        selectedLabelColor = RinTealPrimary
+                                    ),
+                                    modifier = Modifier.weight(1f)
                                 )
 
-                                OutlinedTextField(
-                                    value = portInput,
-                                    onValueChange = { portInput = it },
-                                    label = { Text("Port") },
-                                    modifier = Modifier.weight(1f),
-                                    shape = RoundedCornerShape(10.dp),
-                                    singleLine = true
+                                FilterChip(
+                                    selected = joinScanMode == 1,
+                                    onClick = { joinScanMode = 1 },
+                                    label = { Text("Paste Token") },
+                                    leadingIcon = {
+                                        Icon(Icons.Default.Edit, contentDescription = null, modifier = Modifier.size(16.dp))
+                                    },
+                                    colors = FilterChipDefaults.filterChipColors(
+                                        selectedContainerColor = RinTealPrimary.copy(alpha = 0.2f),
+                                        selectedLabelColor = RinTealPrimary
+                                    ),
+                                    modifier = Modifier.weight(1f)
                                 )
                             }
 
-                            Spacer(modifier = Modifier.height(10.dp))
+                            Spacer(modifier = Modifier.height(16.dp))
 
-                            Button(
-                                onClick = {
-                                    val port = portInput.toIntOrNull() ?: 45990
-                                    state = OnboardingState.CONNECTING
-                                    onJoinMesh(
-                                        QrJoinToken(
-                                            meshName = "Paired Phone Mesh",
-                                            hostPublicKey = "ed25519_host_${ipInput.replace(".", "_")}",
-                                            hostDeviceName = "Host Android Phone",
-                                            ephemeralToken = "init_${System.currentTimeMillis()}",
-                                            hostIp = ipInput.trim(),
-                                            hostPort = port
-                                        )
+                            if (joinScanMode == 0) {
+                                Column(modifier = Modifier.fillMaxWidth()) {
+                                    QrCameraScanner(
+                                        onQrCodeScanned = { rawPayload ->
+                                            val parsed = QrJoinToken.fromJson(rawPayload)
+                                            if (parsed != null && CryptoEngine.isValidPublicKey(parsed.hostPublicKey)) {
+                                                onboardingScanError = null
+                                                state = OnboardingState.CONNECTING
+                                                onJoinMesh(parsed)
+                                            } else {
+                                                onboardingScanError = "Invalid QR Join Token: missing cryptographic key or malformed."
+                                            }
+                                        }
                                     )
-                                },
-                                modifier = Modifier.fillMaxWidth().height(48.dp),
-                                colors = ButtonDefaults.buttonColors(containerColor = RinTealPrimary),
-                                shape = RoundedCornerShape(12.dp),
-                                enabled = ipInput.isNotBlank()
-                            ) {
-                                Text("Connect to Host Phone", color = RinOnPrimaryDark, fontWeight = FontWeight.Bold)
-                            }
 
-                            Spacer(modifier = Modifier.height(12.dp))
+                                    if (onboardingScanError != null) {
+                                        Spacer(modifier = Modifier.height(10.dp))
+                                        Card(
+                                            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer),
+                                            shape = RoundedCornerShape(8.dp),
+                                            modifier = Modifier.fillMaxWidth()
+                                        ) {
+                                            Row(
+                                                modifier = Modifier.padding(12.dp),
+                                                verticalAlignment = Alignment.CenterVertically
+                                            ) {
+                                                Icon(
+                                                    Icons.Default.Close,
+                                                    contentDescription = null,
+                                                    tint = MaterialTheme.colorScheme.error,
+                                                    modifier = Modifier.size(18.dp)
+                                                )
+                                                Spacer(modifier = Modifier.width(8.dp))
+                                                Text(
+                                                    text = onboardingScanError!!,
+                                                    style = MaterialTheme.typography.bodySmall,
+                                                    color = MaterialTheme.colorScheme.onErrorContainer
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+                            } else {
+                                Text(
+                                    text = "Paste the JSON pairing token generated from the host phone:",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
 
-                            OutlinedTextField(
-                                value = manualTokenJson,
-                                onValueChange = { manualTokenJson = it },
-                                placeholder = { Text("Or paste token json / code...", style = MaterialTheme.typography.bodySmall) },
-                                modifier = Modifier.fillMaxWidth(),
-                                shape = RoundedCornerShape(10.dp),
-                                singleLine = true
-                            )
+                                Spacer(modifier = Modifier.height(10.dp))
 
-                            if (manualTokenJson.isNotBlank()) {
-                                Spacer(modifier = Modifier.height(8.dp))
-                                OutlinedButton(
+                                OutlinedTextField(
+                                    value = manualTokenJson,
+                                    onValueChange = {
+                                        manualTokenJson = it
+                                        onboardingManualError = null
+                                    },
+                                    placeholder = { Text("Paste {\"meshName\": ...} token JSON") },
+                                    modifier = Modifier.fillMaxWidth(),
+                                    shape = RoundedCornerShape(10.dp),
+                                    minLines = 3,
+                                    maxLines = 5
+                                )
+
+                                if (onboardingManualError != null) {
+                                    Spacer(modifier = Modifier.height(6.dp))
+                                    Text(
+                                        text = onboardingManualError!!,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.error
+                                    )
+                                }
+
+                                Spacer(modifier = Modifier.height(12.dp))
+
+                                Button(
                                     onClick = {
-                                        state = OnboardingState.CONNECTING
                                         val parsed = QrJoinToken.fromJson(manualTokenJson)
-                                        if (parsed != null) {
+                                        if (parsed != null && CryptoEngine.isValidPublicKey(parsed.hostPublicKey)) {
+                                            onboardingManualError = null
+                                            state = OnboardingState.CONNECTING
                                             onJoinMesh(parsed)
                                         } else {
-                                            onJoinMesh(
-                                                QrJoinToken(
-                                                    meshName = "Paired Mesh",
-                                                    hostPublicKey = "ed25519_pub_" + (1000..9999).random(),
-                                                    hostDeviceName = "Paired Device",
-                                                    ephemeralToken = manualTokenJson
-                                                )
-                                            )
+                                            onboardingManualError = "Invalid pairing token or corrupted cryptographic EC public key."
                                         }
                                     },
-                                    modifier = Modifier.fillMaxWidth()
+                                    modifier = Modifier.fillMaxWidth().height(48.dp),
+                                    colors = ButtonDefaults.buttonColors(containerColor = RinTealPrimary),
+                                    shape = RoundedCornerShape(12.dp),
+                                    enabled = manualTokenJson.isNotBlank()
                                 ) {
-                                    Text("Join from Token")
+                                    Text("Validate & Join Mesh", color = RinOnPrimaryDark, fontWeight = FontWeight.Bold)
                                 }
                             }
                         }

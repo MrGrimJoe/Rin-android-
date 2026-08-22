@@ -176,17 +176,24 @@ class MeshRuntimeEngine(
         }
     }
 
-    private suspend fun handleDiscoveredPeer(meshName: String, publicKey: String, deviceName: String, ip: String, port: Int) {
+    suspend fun handleDiscoveredPeer(meshName: String, publicKey: String, deviceName: String, ip: String, port: Int) {
         val currentMesh = repository.getMeshInfoSync() ?: return
         if (meshName != currentMesh.meshName) return
+
+        // Cryptographic validation: verify that peer publicKey is a genuine EC public key
+        if (!CryptoEngine.isValidPublicKey(publicKey)) {
+            Log.w(tag, "Ignored peer $deviceName ($ip:$port) with invalid/corrupted public key.")
+            return
+        }
 
         val existing = repository.getRemoteDevicesSync()
         val match = existing.find { it.publicKey == publicKey || it.ipAddress == ip }
 
         if (match != null) {
             // Update connection details and state
-            if (match.connectionState != ConnectionState.CONNECTED || match.ipAddress != ip || match.port != port) {
+            if (match.connectionState != ConnectionState.CONNECTED || match.ipAddress != ip || match.port != port || match.publicKey != publicKey) {
                 val updated = match.copy(
+                    publicKey = publicKey,
                     ipAddress = ip,
                     port = port,
                     connectionState = ConnectionState.CONNECTED,
@@ -219,7 +226,30 @@ class MeshRuntimeEngine(
                 isSelf = false
             )
             repository.saveDevice(newDevice)
-            _meshEventNotifications.emit("Discovered and connected to peer: $deviceName ($ip:$port)")
+            _meshEventNotifications.emit("Discovered and authenticated peer: $deviceName ($ip:$port)")
+        }
+    }
+
+    fun triggerDiscoveryProbe(ip: String, port: Int) {
+        scope.launch(Dispatchers.IO) {
+            val meshInfo = repository.getMeshInfoSync() ?: return@launch
+            val sig = CryptoEngine.sign("HELLO_DISCOVERY", meshInfo.localPrivateKey)
+            val packet = MeshPacket(
+                sessionId = CryptoEngine.generateSessionId(),
+                sequence = sequenceNumber.incrementAndGet(),
+                type = PacketType.HELLO,
+                senderKey = meshInfo.localPublicKey,
+                senderName = meshInfo.localDeviceName,
+                payload = "HELLO_DISCOVERY",
+                signature = sig,
+                rail = TransportRail.LAN
+            )
+            val latency = transmitOverNetwork(ip, port, packet)
+            if (latency != null) {
+                _meshEventNotifications.emit("Discovery probe sent to $ip:$port (Latency: ${latency}ms)")
+            } else {
+                _meshEventNotifications.emit("Failed to reach peer at $ip:$port")
+            }
         }
     }
 

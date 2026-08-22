@@ -484,7 +484,8 @@ fun RinMainScreen(
                 onDismiss = { viewModel.closeAddDevice() },
                 onRefreshToken = { viewModel.refreshJoinToken() },
                 onAddDevicePlatform = { platform -> viewModel.addDemoDevice(platform) },
-                onJoinViaToken = { token -> viewModel.joinMeshViaScannedToken(token) }
+                onJoinViaToken = { token -> viewModel.joinMeshViaScannedToken(token) },
+                onProbePeerEndpoint = { ip, port -> viewModel.probePeerEndpoint(ip, port) }
             )
         }
 

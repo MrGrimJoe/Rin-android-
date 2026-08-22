@@ -40,10 +40,21 @@ class NsdMeshDiscovery(
             // DNS-SD TXT Record attributes for automatic Zero-Config identification
             setAttribute("mesh", meshName)
             setAttribute("devname", deviceName)
-            // Store fingerprint / key identifier in TXT
-            val keyFingerprint = if (publicKey.length > 24) publicKey.take(24) else publicKey
-            setAttribute("pubkey", keyFingerprint)
             setAttribute("proto", "rin-v1")
+
+            // Store full EC public key without truncation.
+            // If the key fits within the standard 200-byte DNS-SD attribute chunk, store as "pubkey".
+            // If longer, split into chunk attributes ("pubkey", "pubkey_p2", etc.) so it is never truncated.
+            val maxAttrLen = 200
+            if (publicKey.length <= maxAttrLen) {
+                setAttribute("pubkey", publicKey)
+            } else {
+                val chunks = publicKey.chunked(maxAttrLen)
+                setAttribute("pubkey", chunks[0])
+                chunks.drop(1).forEachIndexed { index, chunk ->
+                    setAttribute("pubkey_p${index + 2}", chunk)
+                }
+            }
         }
 
         registrationListener = object : NsdManager.RegistrationListener {
@@ -138,6 +149,18 @@ class NsdMeshDiscovery(
                         if (v != null) {
                             attrMap[k] = String(v, StandardCharsets.UTF_8)
                         }
+                    }
+
+                    // Reconstruct full public key if split across chunk attributes
+                    val basePubKey = attrMap["pubkey"]
+                    if (basePubKey != null) {
+                        val fullPubKeyBuilder = StringBuilder(basePubKey)
+                        var partIdx = 2
+                        while (attrMap.containsKey("pubkey_p$partIdx")) {
+                            fullPubKeyBuilder.append(attrMap["pubkey_p$partIdx"])
+                            partIdx++
+                        }
+                        attrMap["pubkey"] = fullPubKeyBuilder.toString()
                     }
                 } catch (e: Exception) {
                     Log.w(tag, "Failed to read NSD attributes: ${e.message}")

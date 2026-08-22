@@ -250,6 +250,11 @@ class RinViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun probePeerEndpoint(ip: String, port: Int) {
+        runtimeEngine.triggerDiscoveryProbe(ip, port)
+        closeAddDevice()
+    }
+
     fun addDemoDevice(platform: PlatformType) {
         viewModelScope.launch {
             val key = CryptoEngine.generateIdentityKeyPair()

@@ -59,6 +59,21 @@ object CryptoEngine {
     )
 
     /**
+     * Strictly verifies whether a base64 string is a valid X.509 encoded EC public key.
+     */
+    fun isValidPublicKey(publicKeyB64: String?): Boolean {
+        if (publicKeyB64.isNullOrBlank()) return false
+        return try {
+            val pubBytes = Base64.getDecoder().decode(publicKeyB64)
+            val keySpec = X509EncodedKeySpec(pubBytes)
+            keyFactory.generatePublic(keySpec)
+            true
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    /**
      * Generates a device identity keypair using Elliptic Curve P-256 (secp256r1).
      */
     fun generateIdentityKeyPair(): KeyPair {

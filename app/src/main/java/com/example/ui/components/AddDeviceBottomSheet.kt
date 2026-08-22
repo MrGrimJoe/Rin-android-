@@ -25,6 +25,8 @@ import androidx.compose.material.icons.filled.QrCodeScanner
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilterChipDefaults
@@ -53,6 +55,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.example.core.crypto.CryptoEngine
 import com.example.core.protocol.PlatformType
 import com.example.core.protocol.QrJoinToken
 import com.example.ui.theme.RinCyanAccent
@@ -67,6 +70,7 @@ fun AddDeviceBottomSheet(
     onRefreshToken: () -> Unit,
     onAddDevicePlatform: (PlatformType) -> Unit,
     onJoinViaToken: (QrJoinToken) -> Unit,
+    onProbePeerEndpoint: (String, Int) -> Unit = { _, _ -> },
     modifier: Modifier = Modifier
 ) {
     var selectedTab by remember { mutableIntStateOf(0) }
@@ -257,36 +261,124 @@ fun AddDeviceBottomSheet(
 
                     Spacer(modifier = Modifier.height(16.dp))
 
+                    var scanErrorMessage by remember { mutableStateOf<String?>(null) }
+                    var manualErrorMessage by remember { mutableStateOf<String?>(null) }
+
                     if (scanMode == 0) {
                         // Live CameraX Scanner
-                        QrCameraScanner(
-                            onQrCodeScanned = { rawPayload ->
-                                val parsed = QrJoinToken.fromJson(rawPayload)
-                                if (parsed != null) {
-                                    onJoinViaToken(parsed)
-                                    onDismiss()
-                                } else {
-                                    onJoinViaToken(
-                                        QrJoinToken(
-                                            meshName = "Paired Mesh",
-                                            hostPublicKey = "ed25519_scanned_key_" + (1000..9999).random(),
-                                            hostDeviceName = "Scanned Phone",
-                                            ephemeralToken = rawPayload
+                        Column(modifier = Modifier.fillMaxWidth()) {
+                            QrCameraScanner(
+                                onQrCodeScanned = { rawPayload ->
+                                    val parsed = QrJoinToken.fromJson(rawPayload)
+                                    if (parsed != null && CryptoEngine.isValidPublicKey(parsed.hostPublicKey)) {
+                                        scanErrorMessage = null
+                                        onJoinViaToken(parsed)
+                                        onDismiss()
+                                    } else {
+                                        scanErrorMessage = "Invalid QR Join Token: payload missing cryptographic key or malformed."
+                                    }
+                                }
+                            )
+
+                            if (scanErrorMessage != null) {
+                                Spacer(modifier = Modifier.height(10.dp))
+                                Card(
+                                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer),
+                                    shape = RoundedCornerShape(8.dp),
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Row(
+                                        modifier = Modifier.padding(12.dp),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Icon(
+                                            Icons.Default.Close,
+                                            contentDescription = null,
+                                            tint = MaterialTheme.colorScheme.error,
+                                            modifier = Modifier.size(18.dp)
                                         )
-                                    )
-                                    onDismiss()
+                                        Spacer(modifier = Modifier.width(8.dp))
+                                        Text(
+                                            text = scanErrorMessage!!,
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onErrorContainer
+                                        )
+                                    }
                                 }
                             }
-                        )
+                        }
                     } else {
                         // Manual IP and Token Entry Form
                         Text(
-                            text = "Enter the peer phone's IP address or paste its pairing token:",
+                            text = "Paste a pairing token JSON or enter peer network endpoint:",
                             style = MaterialTheme.typography.bodyMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
 
                         Spacer(modifier = Modifier.height(12.dp))
+
+                        Text(
+                            text = "Paste Pairing Token JSON:",
+                            style = MaterialTheme.typography.labelMedium,
+                            fontWeight = FontWeight.SemiBold,
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
+
+                        Spacer(modifier = Modifier.height(6.dp))
+
+                        OutlinedTextField(
+                            value = manualTokenInput,
+                            onValueChange = {
+                                manualTokenInput = it
+                                manualErrorMessage = null
+                            },
+                            placeholder = { Text("Paste {\"meshName\": ...} token JSON") },
+                            modifier = Modifier.fillMaxWidth().testTag("manual_token_input"),
+                            shape = RoundedCornerShape(10.dp),
+                            minLines = 2,
+                            maxLines = 4
+                        )
+
+                        if (manualErrorMessage != null) {
+                            Spacer(modifier = Modifier.height(6.dp))
+                            Text(
+                                text = manualErrorMessage!!,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.error
+                            )
+                        }
+
+                        Spacer(modifier = Modifier.height(8.dp))
+
+                        Button(
+                            onClick = {
+                                val parsed = QrJoinToken.fromJson(manualTokenInput)
+                                if (parsed != null && CryptoEngine.isValidPublicKey(parsed.hostPublicKey)) {
+                                    manualErrorMessage = null
+                                    onJoinViaToken(parsed)
+                                    onDismiss()
+                                } else {
+                                    manualErrorMessage = "Invalid token format or invalid cryptographic EC public key."
+                                }
+                            },
+                            modifier = Modifier.fillMaxWidth().testTag("pair_from_token_btn"),
+                            colors = ButtonDefaults.buttonColors(containerColor = RinTealPrimary),
+                            shape = RoundedCornerShape(12.dp),
+                            enabled = manualTokenInput.isNotBlank()
+                        ) {
+                            Text("Validate & Join via Token", color = RinOnPrimaryDark, fontWeight = FontWeight.Bold)
+                        }
+
+                        Spacer(modifier = Modifier.height(16.dp))
+
+                        Text(
+                            text = "Or Direct IP Connect (Endpoint Pairing):",
+                            style = MaterialTheme.typography.labelMedium,
+                            fontWeight = FontWeight.SemiBold,
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
+
+                        Spacer(modifier = Modifier.height(8.dp))
 
                         OutlinedTextField(
                             value = deviceNameInput,
@@ -326,73 +418,20 @@ fun AddDeviceBottomSheet(
 
                         Spacer(modifier = Modifier.height(12.dp))
 
-                        Button(
+                        OutlinedButton(
                             onClick = {
                                 val parsedPort = portInput.toIntOrNull() ?: 45990
                                 if (ipInput.isNotBlank()) {
-                                    onJoinViaToken(
-                                        QrJoinToken(
-                                            meshName = token?.meshName ?: "Rin Mesh",
-                                            hostPublicKey = "ed25519_peer_${ipInput.replace(".", "_")}",
-                                            hostDeviceName = deviceNameInput.ifBlank { "Android Device" },
-                                            ephemeralToken = "token_${System.currentTimeMillis()}",
-                                            hostIp = ipInput.trim(),
-                                            hostPort = parsedPort
-                                        )
-                                    )
+                                    // Trigger runtime discovery to resolve peer's genuine key over socket handshake
+                                    onProbePeerEndpoint(ipInput.trim(), parsedPort)
                                     onDismiss()
                                 }
                             },
                             modifier = Modifier.fillMaxWidth().testTag("connect_peer_btn"),
-                            colors = ButtonDefaults.buttonColors(containerColor = RinTealPrimary),
                             shape = RoundedCornerShape(12.dp),
                             enabled = ipInput.isNotBlank()
                         ) {
-                            Text("Connect & Pair Device", color = RinOnPrimaryDark, fontWeight = FontWeight.Bold)
-                        }
-
-                        Spacer(modifier = Modifier.height(16.dp))
-
-                        Text(
-                            text = "Or paste raw JSON token / ephemeral string:",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-
-                        Spacer(modifier = Modifier.height(6.dp))
-
-                        OutlinedTextField(
-                            value = manualTokenInput,
-                            onValueChange = { manualTokenInput = it },
-                            placeholder = { Text("Paste token json or token string...") },
-                            modifier = Modifier.fillMaxWidth().testTag("manual_token_input"),
-                            shape = RoundedCornerShape(10.dp),
-                            singleLine = true
-                        )
-
-                        if (manualTokenInput.isNotBlank()) {
-                            Spacer(modifier = Modifier.height(8.dp))
-                            OutlinedButton(
-                                onClick = {
-                                    val parsed = QrJoinToken.fromJson(manualTokenInput)
-                                    if (parsed != null) {
-                                        onJoinViaToken(parsed)
-                                    } else {
-                                        onJoinViaToken(
-                                            QrJoinToken(
-                                                meshName = "Paired Mesh",
-                                                hostPublicKey = "ed25519_manual_key_" + (1000..9999).random(),
-                                                hostDeviceName = "Paired Phone",
-                                                ephemeralToken = manualTokenInput
-                                            )
-                                        )
-                                    }
-                                    onDismiss()
-                                },
-                                modifier = Modifier.fillMaxWidth()
-                            ) {
-                                Text("Pair from Token")
-                            }
+                            Text("Probe & Handshake Peer IP", fontWeight = FontWeight.SemiBold)
                         }
                     }
                 }
