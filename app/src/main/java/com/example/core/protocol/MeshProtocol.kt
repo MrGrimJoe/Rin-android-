@@ -138,6 +138,8 @@ data class QrJoinToken(
     val meshSecret: String? = null,
     val hostPort: Int = 45990,
     val hostIp: String? = null,
+    val stunIp: String? = null,
+    val stunPort: Int? = null,
     val timestamp: Long = System.currentTimeMillis()
 ) {
     fun toJson(): String {
@@ -149,6 +151,8 @@ data class QrJoinToken(
             meshSecret?.let { put("meshSecret", it) }
             put("hostPort", hostPort)
             hostIp?.let { put("hostIp", it) }
+            stunIp?.let { put("stunIp", it) }
+            stunPort?.let { put("stunPort", it) }
             put("timestamp", timestamp)
         }.toString()
     }
@@ -165,6 +169,8 @@ data class QrJoinToken(
                     meshSecret = json.optString("meshSecret", null),
                     hostPort = json.optInt("hostPort", 45990),
                     hostIp = json.optString("hostIp", null),
+                    stunIp = json.optString("stunIp", null),
+                    stunPort = if (json.has("stunPort")) json.optInt("stunPort", 45990) else null,
                     timestamp = json.optLong("timestamp", System.currentTimeMillis())
                 )
             } catch (e: Exception) {

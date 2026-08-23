@@ -45,7 +45,7 @@ data class ReceivedFileRecord(
 class FileTransferManager(
     private val context: Context,
     private val repository: RinRepository,
-    private val transmitPacket: suspend (String?, Int, MeshPacket) -> Long?
+    private val transmitToDevice: suspend (TrustedDeviceEntity, MeshPacket) -> Long?
 ) {
     private val tag = "FileTransferManager"
     private val activeReceivingFiles = ConcurrentHashMap<String, InFlightReceive>()
@@ -149,7 +149,7 @@ class FileTransferManager(
             rail = targetDevice.activeRail
         )
 
-        val startLatency = transmitPacket(targetDevice.ipAddress, targetDevice.port, startPacket)
+        val startLatency = transmitToDevice(targetDevice, startPacket)
 
         repository.recordPacket(
             MeshPacketEntity(
@@ -209,7 +209,7 @@ class FileTransferManager(
                     rail = targetDevice.activeRail
                 )
 
-                transmitPacket(targetDevice.ipAddress, targetDevice.port, chunkPacket)
+                transmitToDevice(targetDevice, chunkPacket)
 
                 bytesSent += chunkBytes.size
                 val ratio = if (totalSize > 0) (bytesSent.toFloat() / totalSize).coerceIn(0f, 1f) else ((chunkIdx + 1f) / totalChunks)
@@ -241,7 +241,7 @@ class FileTransferManager(
             rail = targetDevice.activeRail
         )
 
-        transmitPacket(targetDevice.ipAddress, targetDevice.port, completePacket)
+        transmitToDevice(targetDevice, completePacket)
 
         repository.recordPacket(
             MeshPacketEntity(

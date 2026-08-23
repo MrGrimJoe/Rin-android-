@@ -39,7 +39,7 @@ class BleMeshDiscovery(
         val RIN_BLE_SERVICE_UUID: UUID = UUID.fromString("0000fe90-0000-1000-8000-00805f9b34fb")
     }
 
-    fun startAdvertising(meshName: String, localPublicKeyPrefix: String) {
+    fun startAdvertising(meshName: String, localPublicKeyPrefix: String, tcpPort: Int = 45990) {
         try {
             if (bluetoothAdapter == null || !bluetoothAdapter.isEnabled) return
             advertiser = bluetoothAdapter.bluetoothLeAdvertiser ?: return
@@ -51,8 +51,8 @@ class BleMeshDiscovery(
                 .setConnectable(false)
                 .build()
 
-            // Transmit truncated mesh identifier hash + public key prefix in service data
-            val payload = "${meshName.hashCode().toString(16)}:${localPublicKeyPrefix.take(6)}"
+            // Transmit truncated mesh identifier hash + public key prefix + port in service data
+            val payload = "${meshName.hashCode().toString(16)}:${localPublicKeyPrefix.take(6)}:$tcpPort"
             val serviceData = payload.toByteArray(StandardCharsets.UTF_8)
 
             val pUuid = ParcelUuid(RIN_BLE_SERVICE_UUID)

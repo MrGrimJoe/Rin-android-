@@ -67,8 +67,8 @@ class MeshRuntimeEngine(
     var activeListeningPort: Int = 45990
         private set
 
-    val fileTransferManager = FileTransferManager(context, repository) { ip, port, pkt ->
-        transmitOverNetwork(ip, port, pkt)
+    val fileTransferManager = FileTransferManager(context, repository) { targetDev, pkt ->
+        transmitToDevice(targetDev, pkt)
     }
 
     private var nsdDiscovery: NsdMeshDiscovery? = null
@@ -124,39 +124,87 @@ class MeshRuntimeEngine(
             val mesh = repository.getMeshInfoSync() ?: return@launch
 
             // 1. UDP Subnet Broadcast Beaconing on port 45991
-            udpBeaconEngine = UdpBeaconEngine(context, scope) { rMesh, rKey, rName, rIp, rPort ->
+            udpBeaconEngine = UdpBeaconEngine(context, scope) { rMesh, rKey, rName, rIp, rPort, rStunIp, rStunPort ->
                 scope.launch(Dispatchers.IO) {
-                    handleDiscoveredPeer(rMesh, rKey, rName, rIp, rPort)
+                    handleDiscoveredPeer(rMesh, rKey, rName, rIp, rPort, stunIp = rStunIp, stunPort = rStunPort, rail = TransportRail.LAN)
                 }
             }
-            udpBeaconEngine?.start(mesh.meshName, mesh.localPublicKey, mesh.localDeviceName, activeListeningPort)
+            val currentStun = _publicStunEndpoint.value
+            udpBeaconEngine?.start(
+                meshName = mesh.meshName,
+                publicKey = mesh.localPublicKey,
+                deviceName = mesh.localDeviceName,
+                tcpPort = activeListeningPort,
+                stunIp = currentStun?.publicIp,
+                stunPort = currentStun?.publicPort
+            )
 
             // 2. Android NsdManager (DNS-SD / mDNS Zero-Config Service Discovery)
             nsdDiscovery = NsdMeshDiscovery(context) { serviceName, host, port, attributes ->
                 scope.launch(Dispatchers.IO) {
                     val peerMeshName = attributes["mesh"] ?: mesh.meshName
                     val peerDeviceName = attributes["devname"] ?: serviceName.removePrefix("Rin-")
-                    val peerPublicKey = attributes["pubkey"] ?: "nsd_peer_${host.replace(".", "_")}"
-                    handleDiscoveredPeer(peerMeshName, peerPublicKey, peerDeviceName, host, port)
+                    val peerPublicKey = attributes["pubkey"] ?: ""
+                    handleDiscoveredPeer(peerMeshName, peerPublicKey, peerDeviceName, host, port, rail = TransportRail.LAN)
                 }
             }
             nsdDiscovery?.registerService(mesh.localDeviceName, activeListeningPort, mesh.meshName, mesh.localPublicKey)
             nsdDiscovery?.startDiscovery()
 
-            // 3. BLE Proximity Rail (Low energy presence beacons)
+            // 3. BLE Proximity Rail (Low energy presence beacons -> triggers active network resolution)
             bleDiscovery = BleMeshDiscovery(context) { token, rssi ->
                 scope.launch(Dispatchers.IO) {
-                    Log.d(tag, "BLE Proximity detected for token $token (RSSI: $rssi dBm)")
+                    val meshInfo = repository.getMeshInfoSync() ?: return@launch
+                    val currentMeshHash = meshInfo.meshName.hashCode().toString(16)
+                    val parts = token.split(":")
+                    val tokenMeshHash = parts.getOrNull(0) ?: ""
+
+                    if (tokenMeshHash != currentMeshHash) {
+                        Log.d(tag, "BLE proximity beacon ignored: mesh hash mismatch ($tokenMeshHash vs $currentMeshHash)")
+                        return@launch
+                    }
+
+                    val keyPrefix = parts.getOrNull(1) ?: ""
+                    val advertisedPort = parts.getOrNull(2)?.toIntOrNull() ?: activeListeningPort
+                    Log.i(tag, "BLE proximity detected Rin mesh member (Prefix: $keyPrefix, Port: $advertisedPort, RSSI: $rssi dBm)")
+
+                    // Check if peer is already in trust database
+                    val existing = repository.getRemoteDevicesSync()
+                    val matchedDevice = existing.find {
+                        keyPrefix.isNotBlank() && (it.publicKey.startsWith(keyPrefix) || it.fingerprint.contains(keyPrefix))
+                    }
+
+                    if (matchedDevice != null && !matchedDevice.ipAddress.isNullOrBlank()) {
+                        Log.d(tag, "BLE proximity matched known peer: ${matchedDevice.name} -> triggering heartbeat ping")
+                        val latency = pingTargetDevice(matchedDevice)
+                        _meshEventNotifications.emit("BLE proximity reactivated ${matchedDevice.name} (${latency}ms, ${rssi} dBm)")
+                    } else {
+                        // Unresolved peer: trigger immediate UDP beacon burst and ZeroConf refresh to resolve genuine EC public key & IP
+                        udpBeaconEngine?.sendImmediateBroadcast()
+                        _meshEventNotifications.emit("BLE proximity detected peer (${rssi} dBm) — resolving network endpoint...")
+                    }
                 }
             }
-            bleDiscovery?.startAdvertising(mesh.meshName, mesh.localPublicKey)
+            bleDiscovery?.startAdvertising(mesh.meshName, mesh.localPublicKey, activeListeningPort)
             bleDiscovery?.startScanning()
 
-            // 4. Wi-Fi Direct (Off-Grid peer-to-peer without router)
+            // 4. Wi-Fi Direct (Off-Grid peer-to-peer TCP transport)
             wifiDirectManager = WifiDirectMeshManager(context) { groupOwnerIp, isHost ->
                 scope.launch(Dispatchers.IO) {
-                    Log.i(tag, "Wi-Fi Direct P2P Group Link established: $groupOwnerIp (isHost: $isHost)")
+                    Log.i(tag, "Wi-Fi Direct P2P Link Established: Host IP: $groupOwnerIp (isHost: $isHost)")
                     _meshEventNotifications.emit("Wi-Fi Direct P2P group active ($groupOwnerIp)")
+
+                    if (!isHost) {
+                        // Client: Immediately probe and handshake Group Owner TCP endpoint
+                        triggerWifiDirectProbe(groupOwnerIp, activeListeningPort)
+                    } else {
+                        // Group Owner: Probe probable client IP allocations on 192.168.49.x subnet
+                        for (lastOctet in 2..8) {
+                            launch(Dispatchers.IO) {
+                                triggerWifiDirectProbe("192.168.49.$lastOctet", activeListeningPort)
+                            }
+                        }
+                    }
                 }
             }
             wifiDirectManager?.start()
@@ -167,6 +215,8 @@ class MeshRuntimeEngine(
                     val candidate = stunEngine.resolvePublicEndpoint(activeListeningPort)
                     if (candidate != null) {
                         _publicStunEndpoint.value = candidate
+                        udpBeaconEngine?.cachedStunIp = candidate.publicIp
+                        udpBeaconEngine?.cachedStunPort = candidate.publicPort
                         Log.i(tag, "STUN Public Reflexive NAT endpoint: ${candidate.publicIp}:${candidate.publicPort}")
                     }
                 } catch (e: Exception) {
@@ -176,7 +226,16 @@ class MeshRuntimeEngine(
         }
     }
 
-    suspend fun handleDiscoveredPeer(meshName: String, publicKey: String, deviceName: String, ip: String, port: Int) {
+    suspend fun handleDiscoveredPeer(
+        meshName: String,
+        publicKey: String,
+        deviceName: String,
+        ip: String,
+        port: Int,
+        stunIp: String? = null,
+        stunPort: Int? = null,
+        rail: TransportRail = TransportRail.LAN
+    ) {
         val currentMesh = repository.getMeshInfoSync() ?: return
         if (meshName != currentMesh.meshName) return
 
@@ -186,22 +245,23 @@ class MeshRuntimeEngine(
             return
         }
 
+        val resolvedRail = if (ip.startsWith("192.168.49.")) TransportRail.WIFI_DIRECT else rail
         val existing = repository.getRemoteDevicesSync()
         val match = existing.find { it.publicKey == publicKey || it.ipAddress == ip }
 
         if (match != null) {
             // Update connection details and state
-            if (match.connectionState != ConnectionState.CONNECTED || match.ipAddress != ip || match.port != port || match.publicKey != publicKey) {
-                val updated = match.copy(
-                    publicKey = publicKey,
-                    ipAddress = ip,
-                    port = port,
-                    connectionState = ConnectionState.CONNECTED,
-                    activeRail = TransportRail.LAN,
-                    lastSeen = System.currentTimeMillis()
-                )
-                repository.saveDevice(updated)
-            }
+            val updated = match.copy(
+                publicKey = publicKey,
+                ipAddress = ip,
+                port = port,
+                stunIp = stunIp ?: match.stunIp,
+                stunPort = stunPort ?: match.stunPort,
+                connectionState = ConnectionState.CONNECTED,
+                activeRail = resolvedRail,
+                lastSeen = System.currentTimeMillis()
+            )
+            repository.saveDevice(updated)
         } else {
             // Auto-join discovered peer in same mesh
             val platform = if (deviceName.contains("PC", ignoreCase = true) || deviceName.contains("Windows", ignoreCase = true)) {
@@ -219,28 +279,76 @@ class MeshRuntimeEngine(
                 name = deviceName,
                 platform = platform,
                 connectionState = ConnectionState.CONNECTED,
-                activeRail = TransportRail.LAN,
+                activeRail = resolvedRail,
                 ipAddress = ip,
                 port = port,
+                stunIp = stunIp,
+                stunPort = stunPort,
                 latencyMs = 2,
                 isSelf = false
             )
             repository.saveDevice(newDevice)
-            _meshEventNotifications.emit("Discovered and authenticated peer: $deviceName ($ip:$port)")
+            _meshEventNotifications.emit("Discovered and authenticated peer: $deviceName ($ip:$port via ${resolvedRail.label})")
         }
     }
 
-    fun triggerDiscoveryProbe(ip: String, port: Int) {
+    fun triggerWifiDirectProbe(ip: String, port: Int) {
         scope.launch(Dispatchers.IO) {
             val meshInfo = repository.getMeshInfoSync() ?: return@launch
-            val sig = CryptoEngine.sign("HELLO_DISCOVERY", meshInfo.localPrivateKey)
+            val currentStun = _publicStunEndpoint.value
+            val helloPayload = JSONObject().apply {
+                put("mesh", meshInfo.meshName)
+                put("name", meshInfo.localDeviceName)
+                put("port", activeListeningPort)
+                put("rail", TransportRail.WIFI_DIRECT.name)
+                currentStun?.let {
+                    put("stunIp", it.publicIp)
+                    put("stunPort", it.publicPort)
+                }
+            }.toString()
+
+            val sig = CryptoEngine.sign(helloPayload, meshInfo.localPrivateKey)
             val packet = MeshPacket(
                 sessionId = CryptoEngine.generateSessionId(),
                 sequence = sequenceNumber.incrementAndGet(),
                 type = PacketType.HELLO,
                 senderKey = meshInfo.localPublicKey,
                 senderName = meshInfo.localDeviceName,
-                payload = "HELLO_DISCOVERY",
+                payload = helloPayload,
+                signature = sig,
+                rail = TransportRail.WIFI_DIRECT
+            )
+            val latency = transmitOverNetwork(ip, port, packet)
+            if (latency != null) {
+                Log.i(tag, "Wi-Fi Direct handshake probe reached peer at $ip:$port (Latency: ${latency}ms)")
+                _meshEventNotifications.emit("Wi-Fi Direct peer connected at $ip:$port (${latency}ms)")
+            }
+        }
+    }
+
+    fun triggerDiscoveryProbe(ip: String, port: Int) {
+        scope.launch(Dispatchers.IO) {
+            val meshInfo = repository.getMeshInfoSync() ?: return@launch
+            val currentStun = _publicStunEndpoint.value
+            val helloPayload = JSONObject().apply {
+                put("mesh", meshInfo.meshName)
+                put("name", meshInfo.localDeviceName)
+                put("port", activeListeningPort)
+                put("rail", TransportRail.LAN.name)
+                currentStun?.let {
+                    put("stunIp", it.publicIp)
+                    put("stunPort", it.publicPort)
+                }
+            }.toString()
+
+            val sig = CryptoEngine.sign(helloPayload, meshInfo.localPrivateKey)
+            val packet = MeshPacket(
+                sessionId = CryptoEngine.generateSessionId(),
+                sequence = sequenceNumber.incrementAndGet(),
+                type = PacketType.HELLO,
+                senderKey = meshInfo.localPublicKey,
+                senderName = meshInfo.localDeviceName,
+                payload = helloPayload,
                 signature = sig,
                 rail = TransportRail.LAN
             )
@@ -284,6 +392,7 @@ class MeshRuntimeEngine(
     }
 
     private suspend fun handleIncomingConnection(socket: Socket) {
+        val clientIp = socket.inetAddress?.hostAddress ?: ""
         try {
             socket.soTimeout = 5000
             val reader = BufferedReader(InputStreamReader(socket.getInputStream(), Charsets.UTF_8))
@@ -320,10 +429,41 @@ class MeshRuntimeEngine(
             }
             writer.println(ackJson.toString())
 
+            // If packet is HELLO discovery packet, register / update the peer in trust database
+            if (packet.type == PacketType.HELLO && clientIp.isNotBlank() && clientIp != "127.0.0.1") {
+                val meshInfo = repository.getMeshInfoSync()
+                var peerMesh = meshInfo?.meshName ?: ""
+                var peerPort = activeListeningPort
+                var peerStunIp: String? = null
+                var peerStunPort: Int? = null
+
+                try {
+                    val payloadJson = JSONObject(packet.payload)
+                    peerMesh = payloadJson.optString("mesh", peerMesh)
+                    peerPort = payloadJson.optInt("port", peerPort)
+                    peerStunIp = payloadJson.optString("stunIp", null)
+                    peerStunPort = if (payloadJson.has("stunPort")) payloadJson.optInt("stunPort", 45990) else null
+                } catch (_: Exception) {}
+
+                val isWifiDirect = clientIp.startsWith("192.168.49.")
+                val effectiveRail = if (isWifiDirect) TransportRail.WIFI_DIRECT else packet.rail
+
+                handleDiscoveredPeer(
+                    meshName = peerMesh,
+                    publicKey = packet.senderKey,
+                    deviceName = packet.senderName,
+                    ip = clientIp,
+                    port = peerPort,
+                    stunIp = peerStunIp,
+                    stunPort = peerStunPort,
+                    rail = effectiveRail
+                )
+            }
+
             // Process payload with real AES-GCM decryption
             processIncomingPacket(packet)
         } catch (e: Exception) {
-            Log.e(tag, "Failed to handle incoming packet", e)
+            Log.e(tag, "Failed to handle incoming packet from $clientIp", e)
         } finally {
             try {
                 socket.close()
@@ -522,6 +662,37 @@ class MeshRuntimeEngine(
         }
     }
 
+    suspend fun transmitToDevice(targetDevice: TrustedDeviceEntity, packet: MeshPacket): Long? = withContext(Dispatchers.IO) {
+        // 1. Primary route: LAN or Wi-Fi Direct IP
+        if (!targetDevice.ipAddress.isNullOrBlank() && targetDevice.ipAddress != "127.0.0.1") {
+            val isWifiDirect = targetDevice.ipAddress.startsWith("192.168.49.")
+            val rail = if (isWifiDirect) TransportRail.WIFI_DIRECT else TransportRail.LAN
+            val latency = transmitOverNetwork(targetDevice.ipAddress, targetDevice.port, packet.copy(rail = rail))
+            if (latency != null) {
+                repository.updateDeviceRail(targetDevice.publicKey, rail, latency)
+                repository.updateDeviceState(targetDevice.publicKey, ConnectionState.CONNECTED)
+                return@withContext latency
+            }
+        }
+
+        // 2. Fallback route: STUN-reflexive public endpoint (Internet P2P NAT hole punch / cross-network)
+        if (!targetDevice.stunIp.isNullOrBlank()) {
+            val stunPort = targetDevice.stunPort ?: 45990
+            Log.i(tag, "Attempting STUN reflexive fallback transmission to ${targetDevice.name} at ${targetDevice.stunIp}:$stunPort")
+            val stunPacket = packet.copy(rail = TransportRail.INTERNET_P2P)
+            val stunLatency = transmitOverNetwork(targetDevice.stunIp, stunPort, stunPacket)
+            if (stunLatency != null) {
+                Log.i(tag, "STUN reflexive fallback succeeded for ${targetDevice.name} (Latency: ${stunLatency}ms)")
+                repository.updateDeviceRail(targetDevice.publicKey, TransportRail.INTERNET_P2P, stunLatency)
+                repository.updateDeviceState(targetDevice.publicKey, ConnectionState.CONNECTED)
+                _meshEventNotifications.emit("Connected to ${targetDevice.name} via STUN Internet P2P (${stunLatency}ms)")
+                return@withContext stunLatency
+            }
+        }
+
+        null
+    }
+
     suspend fun broadcastClipboard(text: String) {
         val meshInfo = repository.getMeshInfoSync() ?: return
         val devices = repository.getRemoteDevicesSync()
@@ -551,9 +722,9 @@ class MeshRuntimeEngine(
             )
         )
 
-        // Physical transmission to all connected remote endpoints with IP
+        // Physical transmission to all connected remote endpoints (with STUN fallback)
         for (dev in devices) {
-            transmitOverNetwork(dev.ipAddress, dev.port, packet)
+            transmitToDevice(dev, packet)
         }
 
         repository.recordPacket(
@@ -607,9 +778,9 @@ class MeshRuntimeEngine(
         )
 
         val realLatency = if (target != null) {
-            transmitOverNetwork(target.ipAddress, target.port, packet)
+            transmitToDevice(target, packet)
         } else {
-            devices.forEach { transmitOverNetwork(it.ipAddress, it.port, packet) }
+            devices.forEach { transmitToDevice(it, packet) }
             null
         }
 
@@ -678,7 +849,7 @@ class MeshRuntimeEngine(
                 rail = targetDevice.activeRail
             )
 
-            val realLatency = transmitOverNetwork(targetDevice.ipAddress, targetDevice.port, packet)
+            val realLatency = transmitToDevice(targetDevice, packet)
 
             repository.recordPacket(
                 MeshPacketEntity(
@@ -715,7 +886,7 @@ class MeshRuntimeEngine(
             rail = targetDevice.activeRail
         )
 
-        val realLatency = transmitOverNetwork(targetDevice.ipAddress, targetDevice.port, packet)
+        val realLatency = transmitToDevice(targetDevice, packet)
         val finalLatency = realLatency ?: 2L
 
         repository.updateDeviceRail(targetDevice.publicKey, targetDevice.activeRail, finalLatency)
@@ -756,7 +927,7 @@ class MeshRuntimeEngine(
             rail = TransportRail.LAN
         )
 
-        devices.forEach { transmitOverNetwork(it.ipAddress, it.port, packet) }
+        devices.forEach { transmitToDevice(it, packet) }
 
         repository.recordPacket(
             MeshPacketEntity(
@@ -790,14 +961,24 @@ class MeshRuntimeEngine(
             PlatformType.ANDROID
         }
 
+        val resolvedRail = if (qrToken.hostIp?.startsWith("192.168.49.") == true) {
+            TransportRail.WIFI_DIRECT
+        } else if (!qrToken.hostIp.isNullOrBlank()) {
+            TransportRail.LAN
+        } else {
+            TransportRail.INTERNET_P2P
+        }
+
         val newDevice = TrustedDeviceEntity(
             publicKey = qrToken.hostPublicKey,
             name = qrToken.hostDeviceName,
             platform = platform,
             connectionState = ConnectionState.CONNECTED,
-            activeRail = TransportRail.LAN,
-            ipAddress = qrToken.hostIp ?: "192.168.1.105",
+            activeRail = resolvedRail,
+            ipAddress = qrToken.hostIp,
             port = qrToken.hostPort,
+            stunIp = qrToken.stunIp,
+            stunPort = qrToken.stunPort,
             latencyMs = 2,
             isSelf = false
         )
@@ -822,11 +1003,11 @@ class MeshRuntimeEngine(
             targetKey = qrToken.hostPublicKey,
             payload = encryptedPayload,
             signature = sig,
-            rail = TransportRail.LAN
+            rail = resolvedRail
         )
 
-        val realLatency = transmitOverNetwork(newDevice.ipAddress, newDevice.port, packet)
-        MeshAuditLogger.logHandshakeCompleted(qrToken.hostDeviceName, qrToken.hostPublicKey, "LAN/QR")
+        val realLatency = transmitToDevice(newDevice, packet)
+        MeshAuditLogger.logHandshakeCompleted(qrToken.hostDeviceName, qrToken.hostPublicKey, resolvedRail.label)
 
         repository.recordPacket(
             MeshPacketEntity(
@@ -839,7 +1020,7 @@ class MeshRuntimeEngine(
                 payloadSummary = "Handshake Complete: Joined ${qrToken.hostDeviceName}",
                 rawPayload = encryptedPayload,
                 signature = sig,
-                rail = TransportRail.LAN,
+                rail = resolvedRail,
                 latencyMs = realLatency ?: 3,
                 isOutbound = true
             )
@@ -906,24 +1087,19 @@ class MeshRuntimeEngine(
 
                 for (dev in devices) {
                     if (dev.isSelf) continue
-                    if (!dev.ipAddress.isNullOrBlank() && dev.ipAddress != "127.0.0.1") {
-                        val realLatency = transmitOverNetwork(dev.ipAddress, dev.port, MeshPacket(
-                            sessionId = CryptoEngine.generateSessionId(),
-                            sequence = sequenceNumber.incrementAndGet(),
-                            type = PacketType.HEARTBEAT,
-                            senderKey = meshInfo.localPublicKey,
-                            senderName = meshInfo.localDeviceName,
-                            targetKey = dev.publicKey,
-                            payload = "PING",
-                            signature = CryptoEngine.sign("PING", meshInfo.localPrivateKey),
-                            rail = dev.activeRail
-                        ))
-                        if (realLatency != null) {
-                            repository.updateDeviceState(dev.publicKey, ConnectionState.CONNECTED)
-                            repository.updateDeviceRail(dev.publicKey, TransportRail.LAN, realLatency)
-                        } else {
-                            repository.updateDeviceState(dev.publicKey, ConnectionState.IDLE)
-                        }
+                    val realLatency = transmitToDevice(dev, MeshPacket(
+                        sessionId = CryptoEngine.generateSessionId(),
+                        sequence = sequenceNumber.incrementAndGet(),
+                        type = PacketType.HEARTBEAT,
+                        senderKey = meshInfo.localPublicKey,
+                        senderName = meshInfo.localDeviceName,
+                        targetKey = dev.publicKey,
+                        payload = "PING",
+                        signature = CryptoEngine.sign("PING", meshInfo.localPrivateKey),
+                        rail = dev.activeRail
+                    ))
+                    if (realLatency == null) {
+                        repository.updateDeviceState(dev.publicKey, ConnectionState.IDLE)
                     }
                 }
             }

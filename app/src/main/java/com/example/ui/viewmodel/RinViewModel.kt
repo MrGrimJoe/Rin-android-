@@ -210,6 +210,7 @@ class RinViewModel(application: Application) : AndroidViewModel(application) {
         val secret = mesh.meshSecret.ifBlank {
             CryptoEngine.deriveMeshSecretFromKey(mesh.localPrivateKey, mesh.meshName)
         }
+        val stun = runtimeEngine.publicStunEndpoint.value
         _currentJoinToken.value = QrJoinToken(
             meshName = mesh.meshName,
             hostPublicKey = mesh.localPublicKey,
@@ -217,7 +218,9 @@ class RinViewModel(application: Application) : AndroidViewModel(application) {
             ephemeralToken = ephemeralToken,
             meshSecret = secret,
             hostPort = runtimeEngine.activeListeningPort,
-            hostIp = currentIp
+            hostIp = currentIp,
+            stunIp = stun?.publicIp,
+            stunPort = stun?.publicPort
         )
     }
 

@@ -15,6 +15,8 @@ data class TrustedDeviceEntity(
     val activeRail: TransportRail,
     val ipAddress: String? = null,
     val port: Int = 45990,
+    val stunIp: String? = null,
+    val stunPort: Int? = null,
     val latencyMs: Long = 2,
     val batteryLevel: Int = 85,
     val isSelf: Boolean = false,
