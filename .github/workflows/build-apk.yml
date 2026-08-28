@@ -1,0 +1,89 @@
+name: Build APK
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Avoid piling up redundant runs on rapid pushes
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Assemble debug APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # This project targets Kotlin 2.2 / AGP 9.1 / Gradle 9.3 — all of which
+      # need JDK 17+. Use 21 for headroom.
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      # The repo doesn't commit the Gradle wrapper jar/scripts, only
+      # gradle/wrapper/gradle-wrapper.properties (distributionUrl points at
+      # 9.3.1). Since there's no gradlew to delegate to, install that exact
+      # version directly and invoke `gradle` (not `./gradlew`) below.
+      # Bump this if gradle/wrapper/gradle-wrapper.properties changes.
+      - name: Set up Gradle 9.3.1
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '9.3.1'
+          cache-read-only: false
+
+      # Accept SDK licenses and let AGP auto-download whatever exact
+      # platform/build-tools it needs (compileSdk here uses AGP's newer
+      # "release(36) { minorApiLevel = 1 }" API-level DSL, so pre-guessing
+      # the exact package name is unreliable — auto-download handles it).
+      - name: Accept Android SDK licenses
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+
+      - name: Install baseline SDK packages
+        run: |
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            "platform-tools" \
+            "platforms;android-36" \
+            "build-tools;36.0.0"
+
+      # app/build.gradle.kts points the "debug" build type at a project-local
+      # debug.keystore (not the default ~/.android/debug.keystore), and that
+      # file is intentionally gitignored. Recreate it with the exact
+      # alias/password the build script expects.
+      - name: Generate debug keystore
+        run: |
+          keytool -genkeypair -v \
+            -keystore debug.keystore \
+            -storepass android \
+            -alias androiddebugkey \
+            -keypass android \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname "CN=Android Debug,O=Android,C=US"
+
+      # No committed .env — the Secrets Gradle Plugin is configured to fall
+      # back to .env.example (GEMINI_API_KEY left commented out), and
+      # gradle.properties sets googleServices.missing.passthrough=true, so
+      # the build proceeds fine without a google-services.json.
+      - name: Build debug APK
+        run: gradle assembleDebug --stacktrace
+
+      - name: Locate APK
+        id: apk
+        run: |
+          APK_PATH=$(find app/build/outputs/apk/debug -name "*.apk" | head -n 1)
+          echo "path=$APK_PATH" >> "$GITHUB_OUTPUT"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rin-debug-apk
+          path: ${{ steps.apk.outputs.path }}
+          if-no-files-found: error
