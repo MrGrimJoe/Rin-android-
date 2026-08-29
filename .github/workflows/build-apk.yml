@@ -82,7 +82,7 @@ jobs:
           echo "path=$APK_PATH" >> "$GITHUB_OUTPUT"
 
       - name: Upload APK artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: rin-debug-apk
           path: ${{ steps.apk.outputs.path }}
