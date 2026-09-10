@@ -165,7 +165,8 @@ class RelayClientTest {
                     }
                     Thread { handleConnection(socket) }.apply { isDaemon = true }.start()
                 }
-            }.apply { isDaemon = true }.start()
+            }.apply { isDaemon = true }
+            acceptThread?.start()
         }
 
         fun stop() {

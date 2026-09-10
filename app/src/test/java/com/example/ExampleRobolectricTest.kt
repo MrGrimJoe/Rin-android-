@@ -26,7 +26,13 @@ class ExampleRobolectricTest {
 
     @Test
     fun `crypto engine encrypts and decrypts payload correctly with AES-GCM`() {
-        val secretKey = "rin_aes_key:MyTestMesh"
+        // encryptPayload/decryptPayload take a real SecretKey (AES-256),
+        // not a raw string -- derive one the same way production code
+        // does rather than hand-rolling a differently-sized key here.
+        val secretKey = CryptoEngine.deriveMeshEncryptionKey(
+            meshSecret = "rin_aes_key",
+            meshName = "MyTestMesh"
+        )
         val plainText = "Confidential clipboard token: 98745-xyz-secret"
 
         val cipherText = CryptoEngine.encryptPayload(plainText, secretKey)
