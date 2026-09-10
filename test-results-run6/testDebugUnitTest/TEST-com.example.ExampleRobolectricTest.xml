@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="com.example.ExampleRobolectricTest" tests="4" skipped="0" failures="0" errors="0" timestamp="2026-09-10T09:10:25.813Z" hostname="runnervmejwal" time="4.439">
+  <properties/>
+  <testcase name="crypto engine signs and verifies real digital signatures with tamper detection" classname="com.example.ExampleRobolectricTest" time="2.245"/>
+  <testcase name="udp beacon json schema validation" classname="com.example.ExampleRobolectricTest" time="0.046"/>
+  <testcase name="crypto engine encrypts and decrypts payload correctly with AES-GCM" classname="com.example.ExampleRobolectricTest" time="0.061"/>
+  <testcase name="read string from context" classname="com.example.ExampleRobolectricTest" time="0.046"/>
+  <system-out><![CDATA[]]></system-out>
+  <system-err><![CDATA[]]></system-err>
+</testsuite>
