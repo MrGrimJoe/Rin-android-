@@ -76,7 +76,27 @@ jobs:
       # gradle.properties sets googleServices.missing.passthrough=true, so
       # the build proceeds fine without a google-services.json.
       - name: Build debug APK
-        run: gradle assembleDebug --stacktrace
+        id: build_apk
+        continue-on-error: true
+        run: |
+          gradle assembleDebug --stacktrace 2>&1 | tee gradle_build_output.log
+          exit ${PIPESTATUS[0]}
+
+      - name: Commit build log on failure (self-diagnosing)
+        if: steps.build_apk.outcome == 'failure'
+        run: |
+          git config user.email "ci@github-actions.local"
+          git config user.name "GitHub Actions CI"
+          git fetch origin ci-debug-logs || true
+          git checkout -B ci-debug-logs
+          cp gradle_build_output.log "gradle-build-run${GITHUB_RUN_NUMBER}.log"
+          git add -f "gradle-build-run${GITHUB_RUN_NUMBER}.log"
+          git commit -m "CI debug log: gradle build failure, run ${GITHUB_RUN_NUMBER}"
+          git push origin ci-debug-logs --force
+
+      - name: Fail the job if the build actually failed
+        if: steps.build_apk.outcome == 'failure'
+        run: exit 1
 
       # JVM unit tests (app/src/test) -- includes CryptoEngineDiscoveryTest,
       # which covers the discovery-hardening beacon-tag/nonce/challenge-
