@@ -15,6 +15,7 @@ import com.example.core.network.BleMeshDiscovery
 import com.example.core.network.MeshNotificationHelper
 import com.example.core.network.NetworkHelper
 import com.example.core.network.NsdMeshDiscovery
+import com.example.core.network.RelayClient
 import com.example.core.network.StunCandidate
 import com.example.core.network.StunHolePunchEngine
 import com.example.core.network.UdpBeaconEngine
@@ -78,6 +79,30 @@ class MeshRuntimeEngine(
         private set
     val stunEngine = StunHolePunchEngine()
 
+    // Opt-in relay fallback tier (NEW). Disabled until configureRelay()
+    // is called -- see RelayClient's doc comment for the full rationale
+    // and the wire protocol, which is identical to the one already
+    // implemented and tested on the Windows side (relay.hpp/relay_server.cpp),
+    // so an Android device and a Windows device can use the same relay
+    // server to reach each other.
+    private val relayClient = RelayClient(scope)
+    private var relayHost: String = ""
+    private var relayPort: Int = 45992
+
+    fun isRelayConfigured(): Boolean = relayClient.isConfigured()
+
+    /**
+     * Configures the relay fallback tier. Call before start() (or any
+     * time -- it takes effect the next time start() runs the relay
+     * registration). Passing a blank host leaves the relay tier
+     * disabled, which is the default: behavior is identical to before
+     * this feature existed until a host is actually configured.
+     */
+    fun configureRelay(host: String, port: Int = 45992) {
+        relayHost = host
+        relayPort = port
+    }
+
     private val _publicStunEndpoint = MutableStateFlow<StunCandidate?>(null)
     val publicStunEndpoint: StateFlow<StunCandidate?> = _publicStunEndpoint.asStateFlow()
 
@@ -117,23 +142,42 @@ class MeshRuntimeEngine(
         udpBeaconEngine?.stop()
         bleDiscovery?.stop()
         wifiDirectManager?.stop()
+        relayClient.stop()
     }
 
     private fun initializeZeroConfDiscovery() {
         scope.launch(Dispatchers.IO) {
             val mesh = repository.getMeshInfoSync() ?: return@launch
 
+            // 0. Opt-in relay fallback registration (NEW) -- no-op if
+            // configureRelay() was never called. Uses the exact same
+            // signature-verification and dispatch path as a direct TCP
+            // connection (verify below, then processIncomingPacket) --
+            // a packet arriving via relay is treated identically to one
+            // arriving via LAN once it's been signature-checked.
+            if (relayHost.isNotBlank()) {
+                relayClient.start(
+                    relayHost = relayHost,
+                    relayPort = relayPort,
+                    ownPublicKey = mesh.localPublicKey,
+                    onPacket = { packet -> processIncomingPacket(packet) },
+                    verifySignature = { packet ->
+                        CryptoEngine.verify(packet.payload, packet.signature, packet.senderKey)
+                    }
+                )
+            }
+
             // 1. UDP Subnet Broadcast Beaconing on port 45991
-            udpBeaconEngine = UdpBeaconEngine(context, scope) { rMesh, rKey, rName, rIp, rPort, rStunIp, rStunPort ->
+            val meshBeaconKey = CryptoEngine.deriveMeshEncryptionKey(mesh.meshSecret, mesh.meshName)
+            udpBeaconEngine = UdpBeaconEngine(context, scope) { rKey, rIp, rPort, rStunIp, rStunPort ->
                 scope.launch(Dispatchers.IO) {
-                    handleDiscoveredPeer(rMesh, rKey, rName, rIp, rPort, stunIp = rStunIp, stunPort = rStunPort, rail = TransportRail.LAN)
+                    onPeerDiscoveredNeedsVerification(rKey, rIp, rPort, stunIp = rStunIp, stunPort = rStunPort, rail = TransportRail.LAN)
                 }
             }
             val currentStun = _publicStunEndpoint.value
             udpBeaconEngine?.start(
-                meshName = mesh.meshName,
+                meshKey = meshBeaconKey,
                 publicKey = mesh.localPublicKey,
-                deviceName = mesh.localDeviceName,
                 tcpPort = activeListeningPort,
                 stunIp = currentStun?.publicIp,
                 stunPort = currentStun?.publicPort
@@ -263,33 +307,298 @@ class MeshRuntimeEngine(
             )
             repository.saveDevice(updated)
         } else {
-            // Auto-join discovered peer in same mesh
-            val platform = if (deviceName.contains("PC", ignoreCase = true) || deviceName.contains("Windows", ignoreCase = true)) {
-                PlatformType.WINDOWS
-            } else if (deviceName.contains("Mac", ignoreCase = true)) {
-                PlatformType.MACOS
-            } else if (deviceName.contains("Tab", ignoreCase = true) || deviceName.contains("iPad", ignoreCase = true)) {
-                PlatformType.TABLET
-            } else {
-                PlatformType.ANDROID
-            }
-
-            val newDevice = TrustedDeviceEntity(
-                publicKey = publicKey,
-                name = deviceName,
-                platform = platform,
-                connectionState = ConnectionState.CONNECTED,
-                activeRail = resolvedRail,
-                ipAddress = ip,
-                port = port,
-                stunIp = stunIp,
-                stunPort = stunPort,
-                latencyMs = 2,
-                isSelf = false
-            )
-            repository.saveDevice(newDevice)
-            _meshEventNotifications.emit("Discovered and authenticated peer: $deviceName ($ip:$port via ${resolvedRail.label})")
+            // NOT auto-trusted anymore (this used to create a CONNECTED
+            // TrustedDeviceEntity right here -- see DESIGN_NOTES.md
+            // "Discovery hardening" for why that was a real hole: a
+            // beacon/mDNS/HELLO advertisement claiming the right mesh
+            // name used to be sufficient on its own). Hand off to the
+            // same challenge/response verification path the UDP beacon
+            // uses -- deviceName/platform get filled in from the
+            // encrypted DiscoveryResponse once the peer actually proves
+            // it holds the real mesh secret, not from this (possibly
+            // cleartext, e.g. via mDNS TXT records or a WiFi-Direct
+            // HELLO probe) advertisement.
+            onPeerDiscoveredNeedsVerification(publicKey, ip, port, stunIp, stunPort, resolvedRail)
         }
+    }
+
+    // -- Discovery hardening (NEW) ---------------------------------------
+    // A beacon/mDNS/HELLO match is only a HINT ("probably our mesh") --
+    // it does NOT grant trust. Trust requires the peer to prove it holds
+    // the real mesh_secret by successfully decrypting a random nonce we
+    // send it (DISCOVERY_CHALLENGE) and echoing it back re-encrypted
+    // (DISCOVERY_RESPONSE). Until that round-trip succeeds, a discovered
+    // public key sits in pendingChallenges, never in the trusted-device
+    // table, and gets zero access to anything.
+    //
+    // Tie-break: if BOTH sides see each other's beacon around the same
+    // time, both would otherwise send a challenge -- harmless but
+    // wasteful and racy to reason about. Only the side whose own public
+    // key sorts lexicographically greater initiates; the other side
+    // waits to receive a challenge instead. Must match Windows'
+    // MeshEngine::on_peer_discovered tie-break exactly (same comparison,
+    // same direction) since both sides need to agree on who initiates.
+    private data class PendingChallenge(val nonce: String, val ip: String, val port: Int, val sentAtMs: Long)
+
+    private val pendingChallenges = java.util.concurrent.ConcurrentHashMap<String, PendingChallenge>()
+
+    suspend fun onPeerDiscoveredNeedsVerification(
+        peerPublicKey: String,
+        ip: String,
+        port: Int,
+        stunIp: String? = null,
+        stunPort: Int? = null,
+        rail: TransportRail = TransportRail.LAN
+    ) {
+        if (!CryptoEngine.isValidPublicKey(peerPublicKey)) return
+        val meshInfo = repository.getMeshInfoSync() ?: return
+
+        val existing = repository.getRemoteDevicesSync()
+        val already = existing.find { it.publicKey == peerPublicKey }
+        if (already != null) {
+            // Already trusted from a prior handshake (this session or a
+            // persisted one) -- just refresh reachability, no new proof
+            // needed. Re-proving on every beacon would be needless churn;
+            // the original handshake already established trust.
+            repository.saveDevice(
+                already.copy(
+                    ipAddress = ip,
+                    port = port,
+                    stunIp = stunIp ?: already.stunIp,
+                    stunPort = stunPort ?: already.stunPort,
+                    connectionState = ConnectionState.CONNECTED,
+                    activeRail = rail,
+                    lastSeen = System.currentTimeMillis()
+                )
+            )
+            return
+        }
+
+        // Tie-break decision + "reserve" the pending-challenge slot
+        // atomically via ConcurrentHashMap.putIfAbsent -- this closes a
+        // real TOCTOU race: a peer can be discovered via more than one
+        // signal at once (UDP beacon racing an mDNS resolution racing a
+        // Wi-Fi-Direct HELLO probe), and if "is anything pending?" and
+        // "insert a pending entry" were two separate steps, two
+        // concurrent callers could both see "nothing pending" and both
+        // send a challenge with a different nonce, silently orphaning
+        // whichever challenge's response arrives second.
+        if (!(meshInfo.localPublicKey > peerPublicKey)) {
+            Log.d(tag, "Beacon/discovery match from $ip:$port -- waiting for their challenge (tie-break)")
+            return
+        }
+
+        val nonce = CryptoEngine.generateDiscoveryNonce()
+        val alreadyPending = pendingChallenges.putIfAbsent(
+            peerPublicKey, PendingChallenge(nonce, ip, port, System.currentTimeMillis())
+        )
+        if (alreadyPending != null) {
+            // Someone else's concurrent call already reserved this slot
+            // and is sending its own challenge -- don't send a second
+            // one, just let that one play out.
+            return
+        }
+
+        MeshAuditLogger.logDiscoveryBeaconMatched(ip, port, peerPublicKey)
+        sendDiscoveryChallenge(ip, port, peerPublicKey, nonce, meshInfo.meshSecret, meshInfo.meshName)
+    }
+
+    private suspend fun sendDiscoveryChallenge(
+        ip: String,
+        port: Int,
+        peerPublicKey: String,
+        nonce: String,
+        meshSecret: String,
+        meshName: String
+    ) {
+        val meshInfo = repository.getMeshInfoSync() ?: return
+        val meshKey = CryptoEngine.deriveMeshEncryptionKey(meshSecret, meshName)
+
+        val body = JSONObject().apply {
+            put("nonce", nonce)
+            put("ts", System.currentTimeMillis())
+            // Every packet on this transport is one-shot (a fresh
+            // outbound TCP connection per packet) -- there is no open
+            // connection to write a reply on. The responder has to open
+            // its OWN new connection back to us, which means it needs to
+            // know our real listening port, not just our IP. Carrying it
+            // inside the encrypted body also means an eavesdropper who
+            // can't decrypt learns nothing extra beyond what the beacon
+            // already exposed.
+            put("challengerPort", activeListeningPort)
+        }
+        val encrypted = CryptoEngine.encryptPayload(body.toString(), meshKey)
+
+        val packet = MeshPacket(
+            sessionId = CryptoEngine.generateSessionId(),
+            sequence = sequenceNumber.incrementAndGet(),
+            type = PacketType.DISCOVERY_CHALLENGE,
+            senderKey = meshInfo.localPublicKey,
+            senderName = meshInfo.localDeviceName,
+            targetKey = peerPublicKey,
+            payload = encrypted,
+            signature = CryptoEngine.sign(encrypted, meshInfo.localPrivateKey),
+            rail = TransportRail.LAN,
+            timestamp = System.currentTimeMillis()
+        )
+
+        transmitOverNetwork(ip, port, packet)
+        MeshAuditLogger.logDiscoveryChallengeSent(ip, port, peerPublicKey)
+    }
+
+    /**
+     * We are the CHALLENGED side here: someone (who matched our beacon's
+     * meshTag, or is guessing) sent us a nonce encrypted with what they
+     * claim is the mesh key. Decrypting it proves WE hold the real
+     * secret; encrypting the echo proves it again on the way back. If we
+     * can't decrypt, we simply don't reply -- no error packet, no
+     * information leak about why it failed, matching the fail-closed
+     * pattern used for broadcast decryption everywhere else.
+     */
+    suspend fun handleDiscoveryChallenge(packet: MeshPacket, remoteIp: String) {
+        val meshInfo = repository.getMeshInfoSync() ?: return
+        val meshKey = CryptoEngine.deriveMeshEncryptionKey(meshInfo.meshSecret, meshInfo.meshName)
+
+        val decrypted = try {
+            CryptoEngine.decryptPayload(packet.payload, meshKey)
+        } catch (e: Exception) {
+            MeshAuditLogger.logDiscoveryRejected(remoteIp, 0, packet.senderKey,
+                "could not decrypt DISCOVERY_CHALLENGE payload with our mesh key: ${e.message}")
+            return
+        }
+
+        val nonce: String
+        val challengerPort: Int
+        try {
+            val body = JSONObject(decrypted)
+            nonce = body.optString("nonce", "")
+            challengerPort = body.optInt("challengerPort", 45990)
+        } catch (e: Exception) {
+            return  // malformed decrypted body -- ignore, matches Windows
+        }
+        if (nonce.isEmpty()) return
+        if (remoteIp.isBlank()) {
+            MeshAuditLogger.logDiscoveryRejected("", 0, packet.senderKey,
+                "no direct remote address to reply to (relay-delivered?)")
+            return
+        }
+
+        val responseBody = JSONObject().apply {
+            put("nonce", nonce)  // echo back exactly what we decrypted
+            put("ts", System.currentTimeMillis())
+            put("deviceName", meshInfo.localDeviceName)
+        }
+        val encrypted = CryptoEngine.encryptPayload(responseBody.toString(), meshKey)
+
+        val response = MeshPacket(
+            sessionId = packet.sessionId,
+            sequence = sequenceNumber.incrementAndGet(),
+            type = PacketType.DISCOVERY_RESPONSE,
+            senderKey = meshInfo.localPublicKey,
+            senderName = meshInfo.localDeviceName,
+            targetKey = packet.senderKey,
+            payload = encrypted,
+            signature = CryptoEngine.sign(encrypted, meshInfo.localPrivateKey),
+            rail = TransportRail.LAN,
+            timestamp = System.currentTimeMillis()
+        )
+        transmitOverNetwork(remoteIp, challengerPort, response)
+
+        // We now know enough to trust THEM too, symmetrically: they
+        // proved they hold the mesh secret by sending a challenge we
+        // could decrypt in the first place (only a real member could
+        // have derived the same mesh key to construct it). Promote
+        // immediately rather than waiting on a challenge of our own --
+        // the tie-break rule means we are, by construction, the side
+        // that does NOT initiate here, so this is the only place our
+        // side of the pair gets promoted.
+        promoteToTrusted(packet.senderKey, packet.senderName, remoteIp, challengerPort)
+    }
+
+    /** We are the CHALLENGER here, checking the echo. */
+    suspend fun handleDiscoveryResponse(packet: MeshPacket, remoteIp: String) {
+        val pending = pendingChallenges[packet.senderKey]
+        if (pending == null) {
+            // No outstanding challenge for this key -- either a stale/
+            // duplicate response, or an unsolicited one. Fail closed:
+            // ignore rather than trust.
+            MeshAuditLogger.logDiscoveryRejected(remoteIp, 0, packet.senderKey,
+                "DISCOVERY_RESPONSE with no matching outstanding challenge")
+            return
+        }
+
+        val meshInfo = repository.getMeshInfoSync() ?: return
+        val meshKey = CryptoEngine.deriveMeshEncryptionKey(meshInfo.meshSecret, meshInfo.meshName)
+
+        val decrypted = try {
+            CryptoEngine.decryptPayload(packet.payload, meshKey)
+        } catch (e: Exception) {
+            // Deliberately do NOT remove the pending entry here -- with
+            // putIfAbsent reserving one slot per peer, there should only
+            // ever be one legitimate outstanding challenge, so a
+            // response that fails to decrypt is a stray/replayed/forged
+            // packet, not the real answer. Removing on a bad response
+            // would let an attacker DoS a legitimate in-flight handshake
+            // just by lobbing garbage back at the challenger first.
+            MeshAuditLogger.logDiscoveryRejected(pending.ip, pending.port, packet.senderKey,
+                "could not decrypt DISCOVERY_RESPONSE payload with our mesh key: ${e.message}")
+            return
+        }
+
+        val echoedNonce: String
+        val deviceName: String
+        try {
+            val body = JSONObject(decrypted)
+            echoedNonce = body.optString("nonce", "")
+            deviceName = body.optString("deviceName", "")
+        } catch (e: Exception) {
+            return  // same reasoning as above -- don't remove on a malformed reply
+        }
+
+        if (echoedNonce.isEmpty() || echoedNonce != pending.nonce) {
+            // Same reasoning again: a mismatched nonce means THIS
+            // response isn't the one we're waiting for, not that the
+            // real one won't still arrive -- the pending entry stays.
+            MeshAuditLogger.logDiscoveryRejected(pending.ip, pending.port, packet.senderKey,
+                "echoed nonce did not match what we sent")
+            return
+        }
+
+        // Genuine match -- consume it now (before promoting), so a
+        // duplicate/replayed copy of this same valid response can't
+        // re-trigger anything once we've already acted on it.
+        pendingChallenges.remove(packet.senderKey)
+        val resolvedName = deviceName.ifEmpty { "Unknown Device" }
+        val ip = remoteIp.ifBlank { pending.ip }
+        promoteToTrusted(packet.senderKey, resolvedName, ip, pending.port)
+    }
+
+    private suspend fun promoteToTrusted(publicKey: String, deviceName: String, ip: String, port: Int) {
+        val platform = if (deviceName.contains("PC", ignoreCase = true) || deviceName.contains("Windows", ignoreCase = true)) {
+            PlatformType.WINDOWS
+        } else if (deviceName.contains("Mac", ignoreCase = true)) {
+            PlatformType.MACOS
+        } else if (deviceName.contains("Tab", ignoreCase = true) || deviceName.contains("iPad", ignoreCase = true)) {
+            PlatformType.TABLET
+        } else {
+            PlatformType.ANDROID
+        }
+        val isWifiDirect = ip.startsWith("192.168.49.")
+
+        val newDevice = TrustedDeviceEntity(
+            publicKey = publicKey,
+            name = deviceName,
+            platform = platform,
+            connectionState = ConnectionState.CONNECTED,
+            activeRail = if (isWifiDirect) TransportRail.WIFI_DIRECT else TransportRail.LAN,
+            ipAddress = ip,
+            port = port,
+            latencyMs = 2,
+            isSelf = false
+        )
+        repository.saveDevice(newDevice)
+        _meshEventNotifications.emit("Discovery verified, now trusted: $deviceName ($ip:$port)")
+        MeshAuditLogger.logDiscoveryVerified(deviceName, publicKey, ip, port)
     }
 
     fun triggerWifiDirectProbe(ip: String, port: Int) {
@@ -430,8 +739,7 @@ class MeshRuntimeEngine(
             writer.println(ackJson.toString())
 
             // If packet is HELLO discovery packet, register / update the peer in trust database
-            if (packet.type == PacketType.HELLO && clientIp.isNotBlank() && clientIp != "127.0.0.1") {
-                val meshInfo = repository.getMeshInfoSync()
+            if (packet.type == PacketType.HELLO && clientIp.isNotBlank() && clientIp != "127.0.0.1") {                val meshInfo = repository.getMeshInfoSync()
                 var peerMesh = meshInfo?.meshName ?: ""
                 var peerPort = activeListeningPort
                 var peerStunIp: String? = null
@@ -460,6 +768,20 @@ class MeshRuntimeEngine(
                 )
             }
 
+            // Discovery challenge/response bypass normal decrypt entirely
+            // (their payloads ARE mesh-key ciphertext, but that decrypt is
+            // attempt-and-see with its own fail-closed handling, not a
+            // hard "drop the whole packet" like generic broadcast decrypt
+            // failure) -- see handleDiscoveryChallenge/handleDiscoveryResponse.
+            if (packet.type == PacketType.DISCOVERY_CHALLENGE) {
+                handleDiscoveryChallenge(packet, clientIp)
+                return
+            }
+            if (packet.type == PacketType.DISCOVERY_RESPONSE) {
+                handleDiscoveryResponse(packet, clientIp)
+                return
+            }
+
             // Process payload with real AES-GCM decryption
             processIncomingPacket(packet)
         } catch (e: Exception) {
@@ -472,6 +794,23 @@ class MeshRuntimeEngine(
     }
 
     suspend fun processIncomingPacket(packet: MeshPacket) {
+        // Reached via the relay fallback path (direct TCP delivery is
+        // intercepted earlier, in handleIncomingConnection, where a real
+        // remoteIp is available to reply on). Relay-delivered packets
+        // have no direct socket to answer over, so a DISCOVERY_CHALLENGE
+        // arriving this way can't be replied to -- matches Windows'
+        // identical relay limitation (remote_ip empty, reply skipped,
+        // rejection logged). Peers reached only via relay still get
+        // trust through the QR join handshake instead.
+        if (packet.type == PacketType.DISCOVERY_CHALLENGE) {
+            handleDiscoveryChallenge(packet, "")
+            return
+        }
+        if (packet.type == PacketType.DISCOVERY_RESPONSE) {
+            handleDiscoveryResponse(packet, "")
+            return
+        }
+
         val meshInfo = repository.getMeshInfoSync() ?: return
 
         // Decrypt payload using AES-256-GCM
@@ -687,6 +1026,27 @@ class MeshRuntimeEngine(
                 repository.updateDeviceState(targetDevice.publicKey, ConnectionState.CONNECTED)
                 _meshEventNotifications.emit("Connected to ${targetDevice.name} via STUN Internet P2P (${stunLatency}ms)")
                 return@withContext stunLatency
+            }
+        }
+
+        // 3. Fallback route: opt-in relay server (NEW). Only tried if
+        // configureRelay() was ever called AND both LAN and STUN above
+        // already failed -- see RelayClient's doc comment for why this
+        // tier exists (in short: the STUN tier above only works by
+        // accident against most real NATs, since it's a plain TCP
+        // connect to a UDP-mapped address; this is the tier that
+        // actually gives two devices on separate networks a working
+        // path). Never attempted, and behaves identically to before
+        // this existed, unless a relay has been explicitly configured.
+        if (relayClient.isConfigured()) {
+            val relayPacket = packet.copy(rail = TransportRail.RELAY)
+            val relayLatency = relayClient.sendViaRelay(targetDevice.publicKey, relayPacket)
+            if (relayLatency != null) {
+                Log.i(tag, "Relay fallback succeeded for ${targetDevice.name} (Latency: ${relayLatency}ms)")
+                repository.updateDeviceRail(targetDevice.publicKey, TransportRail.RELAY, relayLatency)
+                repository.updateDeviceState(targetDevice.publicKey, ConnectionState.CONNECTED)
+                _meshEventNotifications.emit("Connected to ${targetDevice.name} via Relay (${relayLatency}ms)")
+                return@withContext relayLatency
             }
         }
 

@@ -253,6 +253,37 @@ object CryptoEngine {
         return bytesToHex(okm)
     }
 
+    // -- Discovery hardening (NEW) --------------------------------------
+    // A rotating, mesh-secret-derived tag carried on the UDP discovery
+    // beacon INSTEAD of the mesh name / device name in cleartext. Only a
+    // device that already holds the real mesh key can compute a matching
+    // tag, so a passive LAN observer sees an opaque blob, not "mesh
+    // 'Family' has a device named 'Ali-Phone'". timeBucket should be a
+    // coarse window (e.g. unix seconds / 300) -- callers check the
+    // current bucket plus neighbors to tolerate clock drift / broadcast
+    // timing, since this is a discovery HINT, not the trust boundary.
+    // The actual trust boundary is the discovery challenge/response
+    // handshake (see MeshRuntimeEngine), which requires successfully
+    // encrypting/decrypting with this same mesh key, not just producing
+    // a matching tag guess. Must byte-for-byte match
+    // CryptoEngine::derive_beacon_tag on the Windows side -- same HKDF
+    // info string, same 9-byte truncation.
+    fun deriveBeaconTag(meshKey: SecretKey, timeBucket: Long): String {
+        val info = "rin-beacon-tag-v1:$timeBucket"
+        val derived = hkdfDeriveKey(ikm = meshKey.encoded, salt = null, info = info, keyLengthBytes = 32)
+        return Base64.getEncoder().encodeToString(derived.encoded.copyOfRange(0, 9))
+    }
+
+    /**
+     * Random 16-byte nonce, base64-encoded, used as the challenge value
+     * in the discovery challenge/response handshake.
+     */
+    fun generateDiscoveryNonce(): String {
+        val buf = ByteArray(16)
+        secureRandom.nextBytes(buf)
+        return Base64.getEncoder().encodeToString(buf)
+    }
+
     // =========================================================================
     // Digital Signatures (Strict ECDSA with SHA-256)
     // =========================================================================

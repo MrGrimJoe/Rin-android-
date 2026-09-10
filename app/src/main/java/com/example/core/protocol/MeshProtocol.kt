@@ -40,7 +40,16 @@ enum class PacketType {
     FILE_COMPLETE,
     REVOCATION,
     HEARTBEAT,
-    ACK
+    ACK,
+    // NEW -- discovery hardening. Sent point-to-point over TCP once a UDP
+    // beacon's meshTag looks like it might be ours; both packets' payloads
+    // are mesh-key AES-256-GCM ciphertext (never plaintext), so a peer
+    // that can't decrypt them (doesn't hold the real mesh secret) never
+    // gets promoted to trusted. See MeshRuntimeEngine's discovery
+    // challenge/response handling. Wire strings must match Windows'
+    // PacketType::DiscoveryChallenge/DiscoveryResponse exactly.
+    DISCOVERY_CHALLENGE,
+    DISCOVERY_RESPONSE
 }
 
 data class FileTransferMetadata(

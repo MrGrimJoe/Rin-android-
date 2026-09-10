@@ -150,6 +150,50 @@ object MeshAuditLogger {
         )
     }
 
+    // -- Discovery hardening (NEW) ----------------------------------
+    fun logDiscoveryBeaconMatched(host: String, port: Int, peerKey: String) {
+        // Deliberately no device_name/mesh_name here -- at this point
+        // all we know is "a beacon/mDNS/HELLO's rotating tag or claimed
+        // mesh matched ours", NOT who this is. That's only established
+        // (and only then worth logging by name) once the discovery
+        // challenge/response below actually succeeds.
+        log(
+            level = AuditLevel.INFO,
+            category = AuditCategory.DISCOVERY_UDP,
+            message = "Discovery match at $host:$port -- not yet trusted, sending discovery challenge",
+            peerKey = peerKey
+        )
+    }
+
+    fun logDiscoveryChallengeSent(host: String, port: Int, peerKey: String) {
+        log(
+            level = AuditLevel.HANDSHAKE,
+            category = AuditCategory.DISCOVERY_UDP,
+            message = "Discovery challenge sent to $host:$port (proof of mesh-secret possession required before trust)",
+            peerKey = peerKey
+        )
+    }
+
+    fun logDiscoveryVerified(deviceName: String, peerKey: String, host: String, port: Int) {
+        log(
+            level = AuditLevel.SECURITY_SUCCESS,
+            category = AuditCategory.DISCOVERY_UDP,
+            message = "Discovery challenge verified -- '$deviceName' at $host:$port proved mesh-secret possession, now trusted",
+            peerName = deviceName,
+            peerKey = peerKey
+        )
+    }
+
+    fun logDiscoveryRejected(host: String, port: Int, peerKey: String?, reason: String) {
+        log(
+            level = AuditLevel.SECURITY_WARNING,
+            category = AuditCategory.DISCOVERY_UDP,
+            message = "Discovery challenge/response rejected for $host:$port: $reason -- peer NOT trusted",
+            peerKey = peerKey,
+            details = reason
+        )
+    }
+
     fun logHandshakeInitiated(targetIp: String, peerName: String?, ephemeralToken: String?) {
         log(
             level = AuditLevel.HANDSHAKE,

@@ -12,6 +12,9 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: write
+
 jobs:
   build:
     name: Assemble debug APK
@@ -74,6 +77,44 @@ jobs:
       # the build proceeds fine without a google-services.json.
       - name: Build debug APK
         run: gradle assembleDebug --stacktrace
+
+      # JVM unit tests (app/src/test) -- includes CryptoEngineDiscoveryTest,
+      # which covers the discovery-hardening beacon-tag/nonce/challenge-
+      # response crypto primitives added alongside the Windows-side
+      # equivalent in rin-windows/tests/test_discovery.cpp. Run separately
+      # from assembleDebug (continue-on-error) so a test failure still
+      # produces a committed debug log instead of just a bare CI red X --
+      # same self-diagnosing pattern as rin-windows/.github/workflows/build.yml.
+      - name: Run JVM unit tests
+        id: run_tests
+        continue-on-error: true
+        run: |
+          gradle testDebugUnitTest --stacktrace 2>&1 | tee gradle_test_output.log
+          exit ${PIPESTATUS[0]}
+
+      - name: Commit test log on failure (self-diagnosing)
+        if: steps.run_tests.outcome == 'failure'
+        run: |
+          git config user.email "ci@github-actions.local"
+          git config user.name "GitHub Actions CI"
+          git fetch origin ci-debug-logs || true
+          git checkout -B ci-debug-logs
+          cp gradle_test_output.log "gradle-test-run${GITHUB_RUN_NUMBER}.log"
+          # Also pull in the full HTML/XML test reports if Gradle produced
+          # any -- these have per-test stack traces the plain console log
+          # truncates.
+          if [ -d app/build/test-results ]; then
+            mkdir -p "test-results-run${GITHUB_RUN_NUMBER}"
+            cp -r app/build/test-results/* "test-results-run${GITHUB_RUN_NUMBER}/" || true
+          fi
+          git add -f "gradle-test-run${GITHUB_RUN_NUMBER}.log" "test-results-run${GITHUB_RUN_NUMBER}" 2>/dev/null || \
+            git add -f "gradle-test-run${GITHUB_RUN_NUMBER}.log"
+          git commit -m "CI debug log: gradle test failure, run ${GITHUB_RUN_NUMBER}"
+          git push origin ci-debug-logs --force
+
+      - name: Fail the job if tests actually failed
+        if: steps.run_tests.outcome == 'failure'
+        run: exit 1
 
       - name: Locate APK
         id: apk
