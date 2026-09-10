@@ -4,6 +4,9 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
+import org.robolectric.annotation.Config
 
 /**
  * Tests for the discovery-hardening crypto primitives added alongside
@@ -14,9 +17,17 @@ import org.junit.Test
  * since it requires mocking RinRepository/Context; see DESIGN_NOTES.md
  * "Discovery hardening" for that as a flagged follow-up).
  *
- * These are pure functions with no Android/Context dependency, so they
- * run as plain JVM unit tests -- no Robolectric needed.
+ * Most of these are pure functions with no Android/Context dependency,
+ * but the round-trip test below builds its challenge/response bodies
+ * with org.json.JSONObject as test scaffolding, and that throws
+ * "not mocked" on a plain JVM unit test (Android's stub jar, not the
+ * real implementation) -- same reason ExampleRobolectricTest.kt already
+ * needs RobolectricTestRunner. Applying it to the whole class rather
+ * than splitting this one test out; it doesn't change behavior for the
+ * other, JSON-free tests here.
  */
+@RunWith(RobolectricTestRunner::class)
+@Config(sdk = [34])
 class CryptoEngineDiscoveryTest {
 
     private fun fixedKey(seed: Int): javax.crypto.SecretKey {
