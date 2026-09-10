@@ -859,6 +859,15 @@ class MeshRuntimeEngine(
             PacketType.REVOCATION -> "Device Revocation Notice"
             PacketType.HELLO -> "Mesh Peer Discovery"
             PacketType.ACK -> "Packet Delivery Acknowledged"
+            // DISCOVERY_CHALLENGE/DISCOVERY_RESPONSE are fully handled and
+            // return earlier in this same function (see the two `if
+            // (packet.type == PacketType.DISCOVERY_...)` checks above,
+            // before meshInfo/decryption even happen) -- they can never
+            // actually reach this `when`. error() instead of a fake
+            // summary string so that stays true loudly if this function's
+            // control flow ever changes, rather than silently.
+            PacketType.DISCOVERY_CHALLENGE, PacketType.DISCOVERY_RESPONSE ->
+                error("${packet.type} should have returned earlier in handleIncomingConnection")
         }
 
         repository.recordPacket(
