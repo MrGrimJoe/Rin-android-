@@ -1353,13 +1353,19 @@ class MeshRuntimeEngine(
         )
         repository.saveDevice(newDevice)
 
-        // If joining an existing mesh via QR token, adopt the meshSecret from host
-        val activeSecret = qrToken.meshSecret ?: meshInfo.meshSecret
-        if (!qrToken.meshSecret.isNullOrBlank() && meshInfo.meshSecret != qrToken.meshSecret) {
-            repository.saveMesh(meshInfo.copy(meshSecret = qrToken.meshSecret))
+        // If joining an existing mesh via QR token, adopt the meshSecret AND meshName from host.
+        // The name is the HKDF salt in deriveMeshEncryptionKey, so keeping our own name while
+        // adopting the host's secret yields a different mesh key than the host's: every
+        // mesh-key packet (broadcasts, discovery challenge, beacon tag) then fails to
+        // decrypt/match. First-launch joins were unaffected only because
+        // joinMeshViaScannedToken creates the mesh with token.meshName up front.
+        val activeSecret = qrToken.meshSecret?.takeIf { it.isNotBlank() } ?: meshInfo.meshSecret
+        val activeMeshName = qrToken.meshName.ifBlank { meshInfo.meshName }
+        if (activeSecret != meshInfo.meshSecret || activeMeshName != meshInfo.meshName) {
+            repository.saveMesh(meshInfo.copy(meshName = activeMeshName, meshSecret = activeSecret))
         }
 
-        val meshKey = CryptoEngine.deriveMeshEncryptionKey(activeSecret, meshInfo.meshName)
+        val meshKey = CryptoEngine.deriveMeshEncryptionKey(activeSecret, activeMeshName)
         val encryptedPayload = CryptoEngine.encryptPayload(qrToken.ephemeralToken, meshKey)
         val sig = CryptoEngine.sign(encryptedPayload, meshInfo.localPrivateKey)
 
@@ -1394,7 +1400,7 @@ class MeshRuntimeEngine(
                 isOutbound = true
             )
         )
-        _meshEventNotifications.emit("Authenticated ${qrToken.hostDeviceName} into ${meshInfo.meshName}")
+        _meshEventNotifications.emit("Authenticated ${qrToken.hostDeviceName} into $activeMeshName")
         return true
     }
 

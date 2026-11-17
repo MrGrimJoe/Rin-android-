@@ -27,7 +27,7 @@ Rin turns your local devices into a cohesive, private computing mesh. Once devic
 - 🌍 **NAT Traversal & Cellular STUN Engine**:
   - RFC 5389 compliant STUN client for public reflexive IP and UDP pinhole mapping across mobile data and distinct networks (`StunHolePunchEngine`).
 - 🔀 **Relay Fallback (opt-in)**:
-  - For devices with no direct path to each other at all (different networks, no STUN success), an optional self-hostable relay tier forwards traffic as a last resort. The relay is a dumb forwarder — it only ever sees the same AES-256-GCM ciphertext and metadata already visible on the LAN beacon, never plaintext. No default relay server; if you never point a device at one, this code path is never used.
+  - For devices with no direct path to each other at all (different networks, no STUN success), an optional self-hostable relay tier forwards traffic as a last resort. The relay is a dumb forwarder — it only ever sees the same AES-256-GCM ciphertext and metadata already visible on the LAN beacon, never plaintext. No default relay server; if you never point a device at one, this code path is never used. **Not usable from the app yet:** nothing calls `MeshRuntimeEngine.configureRelay()` and there is no setting for it, so the client is never started on a phone.
 - ⚡ **Multi-Rail ZeroConf Discovery**:
   - **UDP Subnet Broadcasts**: Sub-millisecond peer discovery on port `45991`.
   - **Android NSD / mDNS**: Local domain ZeroConf discovery (`_rin._tcp.local`).
@@ -110,19 +110,24 @@ Every packet exchanged between peers conforms to this JSON envelope:
 
 ```json
 {
-  "version": 1,
-  "sessionId": "4a7f-9b21-uuid",
-  "sequence": 142,
+  "v": 1,
+  "sess": "sess_4a7f9b21",
+  "seq": 142,
   "type": "FILE_START",
   "senderKey": "<Base64_ECDSA_Public_Key>",
   "senderName": "Pixel 8 Pro",
   "targetKey": "<Optional_Base64_Target_Public_Key>",
   "payload": "<AES_256_GCM_Encrypted_Base64_Payload>",
-  "signature": "<Base64_ECDSA_Signature_of_Payload_and_Metadata>",
+  "sig": "<ecdsa:Base64_Signature_of_payload_field>",
   "rail": "LAN",
-  "timestamp": 1771583429000
+  "ts": 1771583429000
 }
 ```
+
+One JSON object per line over TCP. `targetKey` is omitted (not null) when a
+packet has no specific target. Field names are the abbreviated ones above on
+both platforms — the Windows core's tests pin them, so a rename here silently
+breaks interop.
 
 ### Packet Types
 | Packet Type | Description |
